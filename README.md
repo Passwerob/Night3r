@@ -17,7 +17,9 @@ Source code is in this repository. The paper-final checkpoints are on Hugging Fa
 
 The consolidated MVSEC / DSEC / DL3DV evaluation scenes are at [Passwerob/Night3R-test](https://huggingface.co/datasets/Passwerob/Night3R-test).
 
-Loading still needs the public MASt3R backbone `MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`. That third-party checkpoint is not redistributed in this release.
+Training scenes, DA3 pseudo-depth, and the DSEC split record are at [Passwerob/Night3R-train](https://huggingface.co/datasets/Passwerob/Night3R-train).
+
+The MASt3R backbone used at load time is archived in the weight repo under `checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, together with the retrieval files and the optional Dark3R LoRA. The step-100 comparison also keeps the global-final initialization and the step-200 diagnostic checkpoint in `checkpoints/comparison/`.
 
 ## What Is Kept
 
