@@ -1,0 +1,9 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# MVSEC-only counterpart using the same BRG initialization and optimizer recipe.
+dataset:
+  root: "/data/fcr/data/train_data/MVSEC"
+
+training:
+  balanced_dataset_sampling: false
+

@@ -1,0 +1,1072 @@
+Night3R 方法总结文档
+版本日期：2026-07-04
+当前主权重：
+/data/fcr/data/Night3R/outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+================================================================================
+0. 一句话总结
+================================================================================
+
+Night3R 的核心目标是：在低光/夜间 RGB 图像不可靠时，引入 event camera 的局部结构线索，提升 MASt3R/Dark3R 类 pairwise 3D reconstruction 的深度和几何稳定性。
+
+相对于我们最初的 Night3R scalar-g 版本，当前版本的核心变化是：
+
+1. 将全局 scalar gate 改为 token-level tensor gate。
+2. 引入 event reliability statistics，用局部 event density、occupancy、polarity balance 判断 event 是否可靠。
+3. 将 event 融合改成 bounded residual fusion，使 event 只能作为受限 residual 补充 RGB backbone，而不是直接重写 MASt3R/Dark3R 的 token。
+4. 加入 gate regularization，防止 event gate 全图乱开，尤其抑制低 event 区域和 gate logit 饱和。
+5. 在训练上采用保守 adapter-style fine-tuning：冻结 RGB backbone，只小学习率训练 event encoder 和 fusion adapter，避免破坏预训练 RGB 几何能力。
+
+当前测试结果表明，在 MVSEC-current 和 DSEC-current 的 128-pair quick evaluation 中，Night3R-1k 相比原版 MASt3R 在 raw absolute depth 和 median-aligned depth 上都明显更好。
+
+================================================================================
+1. 任务定义与动机
+================================================================================
+
+原版 MASt3R / Dark3R 主要依赖 RGB 图像对进行几何预测。对于正常光照场景，RGB 图像中有足够纹理、颜色和边缘，模型可以利用预训练的视觉几何先验产生较好的 dense 3D / depth 结果。
+
+但是在夜间或极低光场景中，RGB 图像会出现以下问题：
+
+1. 局部区域过暗，纹理不可见。
+2. 运动目标或相机运动带来模糊。
+3. 灯光区域容易过曝，造成大片无效纹理。
+4. 暗部噪声和压缩伪影会干扰 RGB feature。
+5. 原版 MASt3R 只能依赖 RGB prior，容易出现尺度漂移、轮廓丢失、局部深度块状错误。
+
+Event camera 的优势在于：
+
+1. 对亮度变化敏感，暗光下仍可能捕捉运动边缘。
+2. 时间分辨率高，可以提供运动边界和结构变化。
+3. 在 RGB 纹理不可见时，event 仍可能保留轮廓、边缘、车轮、路沿、建筑边界等几何信息。
+
+因此 Night3R 的命题不是“用 event 替代 RGB”，而是：
+
+在 RGB 仍有预训练几何先验的情况下，让 event 在可靠区域作为局部 residual 补充，从而提升低光/夜间 reconstruction。
+
+================================================================================
+2. 与初版 scalar-g Night3R 的区别
+================================================================================
+
+初版 Night3R 已经有 event encoder，也能把 event token 融合到 MASt3R/Dark3R 的 RGB token 中。但初版融合更接近：
+
+F = F_rgb + g * Delta_event
+
+其中 g 是一个全局可学习标量。
+
+这个设计的问题是：
+
+1. g 对所有图像、所有 token、所有区域共享。
+2. 它无法区分“哪里 event 有用，哪里 event 没用”。
+3. 如果 g 太小，event 基本进不来，模型退化成 RGB-only。
+4. 如果 g 太大，event 会全图污染 RGB backbone，容易破坏 MASt3R 的预训练几何先验。
+5. 对于夜间场景，event 的有效性是局部的：车轮、边缘、路沿、建筑轮廓可能有用，天空、黑墙、弱纹理区域或噪声区域不一定有用。scalar-g 无法表达这种空间差异。
+
+当前版本将 scalar-g 改为 token-level reliability gate：
+
+F_i = F_rgb_i + s_event * g_i * Delta_event_i
+
+其中：
+
+F_i 表示第 i 个 token 的 fused feature。
+F_rgb_i 是原 MASt3R/Dark3R RGB token。
+Delta_event_i 是 event branch 产生的 residual feature。
+s_event 是全局有界 event residual scale。
+g_i 是第 i 个 token 的 event reliability gate。
+
+这个变化的意义是：
+
+1. event 融合从全局控制变成局部控制。
+2. 每个 token 都可以根据自己的 event reliability 决定是否使用 event。
+3. event 仍然只是 residual，不直接替换 RGB token。
+4. 通过 gate cap、event scale 和 regularization 控制 event 注入强度，保护预训练 backbone。
+
+================================================================================
+3. 输入与 Event Voxel 表示
+================================================================================
+
+Night3R 的输入包括：
+
+1. RGB image pair: I_1, I_2
+2. Event stream 或已处理好的 event voxel
+3. 可选的 depth_gt、relative pose、intrinsics，用于监督或评估
+
+Event 数据一般表示为事件序列：
+
+e_k = (x_k, y_k, t_k, p_k)
+
+其中：
+
+x_k, y_k 是事件像素位置。
+t_k 是事件时间戳。
+p_k 是 polarity，表示亮度上升或下降。
+
+当前主模型使用：
+
+num_bins = 4
+polarity_separate = true
+voxel_channels = 8
+
+也就是说，每个 event voxel 有 8 个通道：
+
+positive polarity 的 4 个 temporal bins
+negative polarity 的 4 个 temporal bins
+
+通道布局可以理解为：
+
+E = [E_pos_1, E_pos_2, E_pos_3, E_pos_4, E_neg_1, E_neg_2, E_neg_3, E_neg_4]
+
+事件时间会被归一化到 [0, B-1]：
+
+\tilde{t}_k = \frac{t_k - t_{min}}{t_{max} - t_{min}} (B - 1)
+
+其中 B = 4。
+
+然后使用 temporal bilinear accumulation：
+
+b_l = floor(\tilde{t}_k)
+b_r = min(b_l + 1, B - 1)
+w_r = \tilde{t}_k - b_l
+w_l = 1 - w_r
+
+事件会被累加到左右两个 temporal bins：
+
+E[b_l, y_k, x_k] += w_l
+E[b_r, y_k, x_k] += w_r
+
+如果 polarity_separate = true，则 positive event 和 negative event 累加到不同通道组中。
+
+Event voxel 之后会做 non-zero normalization：
+
+1. 只统计非零 event voxel 值。
+2. 对非零值减均值、除标准差。
+3. 零值保持为零。
+
+这样做的目的是：
+
+1. 保留 event 的稀疏结构。
+2. 避免不同样本 event 数量差异过大导致尺度不稳定。
+3. 不把空 event 区域错误归一化成有信号区域。
+
+================================================================================
+4. Event Token Encoder
+================================================================================
+
+Night3R 不使用 E2VID 等方式先把 event 重建成图像，而是直接把 event voxel 编码为 token。
+
+Event encoder 的设计目标是：
+
+1. event token 和 MASt3R/Dark3R 的 image token 具有相同 token grid。
+2. event token 和 RGB token 具有相同 feature dimension。
+3. event branch 尽量复用 MASt3R/Dark3R 的 token architecture，使 event feature 落入兼容的 token space。
+
+具体做法：
+
+1. 使用 Conv2D patch embedding 将 event voxel patchify：
+
+T_event = PatchEmbed(E)
+
+其中 E 是 8-channel event voxel。
+
+2. patch size 与 MASt3R/Dark3R image encoder 的 patch size 对齐。
+
+3. event patch token 经过一份拷贝的 Dark3R encoder blocks：
+
+Z_event = Enc_event(T_event)
+
+这里 Enc_event 可以理解为 Dark3R image encoder blocks 的 copy。
+
+4. 输出 event token 与 RGB token 形状一致：
+
+Z_event, Z_rgb \in R^{B \times N \times C}
+
+其中：
+
+B 是 batch size。
+N 是 token 数量。
+C 是 token dimension。
+
+这个设计的好处是：
+
+1. 不需要把 event 转成伪 RGB 图像。
+2. event branch 直接学习几何相关 token 表达。
+3. 融合时不需要额外处理分辨率或 token mismatch。
+4. 保持下游 MASt3R/Dark3R head 的接口不变。
+
+================================================================================
+5. Event Reliability Statistics
+================================================================================
+
+这是当前版本相对于 scalar-g 初版的核心改动之一。
+
+早期 scalar-g 只学习一个全局 event 注入强度，不知道局部 event 是否可靠。当前版本为每个 token 计算 event reliability statistics，用来指导 token-level gate。
+
+对每个 token 区域 i，计算三个主要统计量：
+
+1. Event density
+
+d_i = log(1 + \sum_{c,x,y \in i} |E_{cxy}|)
+
+含义：
+
+density 衡量该 token 区域的 event 活动强度。暗光中，如果物体边缘或运动轮廓产生了足够 event，density 会较高，说明该区域可能有可利用的结构信息。
+
+但 density 不能单独作为可靠性，因为少数异常像素或 hot pixels 也可能产生很高 density。
+
+2. Event occupancy
+
+o_i = mean_{x,y \in i} 1[\sum_c |E_{cxy}| > 0]
+
+含义：
+
+occupancy 衡量 event 在 token 区域内的空间覆盖率。它可以区分：
+
+局部孤立噪声点：density 可能高，但 occupancy 低。
+真实边缘/轮廓：通常会在一个局部区域内形成更连续的 event 覆盖。
+
+所以 occupancy 用来避免模型被局部爆点或稀疏噪声误导。
+
+3. Polarity balance
+
+令：
+
+P_i = \sum_{positive\ channels, x,y \in i} |E|
+N_i = \sum_{negative\ channels, x,y \in i} |E|
+
+则：
+
+b_i = \frac{|P_i - N_i|}{P_i + N_i + \epsilon}
+
+含义：
+
+polarity balance 衡量正负 polarity 是否极端不平衡。真实运动边缘可能存在一定 polarity 偏置，但如果局部 polarity 极端单边，也可能来自曝光闪烁、噪声、传感器偏置或局部异常响应。
+
+因此 b_i 不是直接判断“好/坏”的硬规则，而是作为 gate 的一个 reliability cue。
+
+最终每个 token 的统计向量为：
+
+r_i = [d_i, o_i, b_i]
+
+实现中还会对 event statistics 做 z-score normalization，并支持 source-specific normalization：
+
+\hat{r}_i = Norm(r_i)
+
+source id 包括：
+
+mvsec -> 0
+dsec  -> 1
+dl3dv -> 2
+
+这样做是因为不同数据集的 event 密度、曝光、运动速度和预处理方式不同。source-aware normalization 可以降低跨数据集统计分布差异对 gate 的影响。
+
+================================================================================
+6. BRG: Bounded Reliability Gate
+================================================================================
+
+当前主融合模块叫 Night3RBoundedEventFusion，也可以称为 BRG。
+
+BRG 的核心思想是：
+
+Event 不是直接替换 RGB feature，而是作为一个有边界、有可靠性控制、有正则约束的 residual 注入到 RGB token 中。
+
+整体公式：
+
+F_i = R_i + s_e \cdot g_i \cdot g^c_i \cdot \Delta E_i
+
+其中：
+
+R_i 是 RGB token。
+\Delta E_i 是 event residual token。
+s_e 是全局 event scale。
+g_i 是 token-level reliability gate。
+g^c_i 是可选 channel modulation，当前主模型中关闭，因此 g^c_i = 1。
+F_i 是融合后的 token。
+
+--------------------------------------------------------------------------------
+6.1 Event residual branch
+--------------------------------------------------------------------------------
+
+Event token 先经过 LayerNorm 和 MLP projection：
+
+\Delta E_i = P(LN(E_i))
+
+其中 P 是 event projection MLP。
+
+注意：BRG 不会对 RGB output path 做强制 layer normalization 后替换，而是保留原始 RGB token R_i，只加一个小 residual。
+
+这样设计是为了保护 MASt3R/Dark3R 的预训练 token distribution。
+
+--------------------------------------------------------------------------------
+6.2 Token-level gate
+--------------------------------------------------------------------------------
+
+Gate 只使用 event statistics 生成：
+
+l_i = MLP(\hat{r}_i) + b_{source}
+
+其中：
+
+\hat{r}_i 是归一化后的 event reliability statistics。
+b_{source} 是 source-specific gate bias。
+
+然后对 logit 做 bounded transform：
+
+\bar{l}_i = L \cdot tanh(l_i / L)
+
+其中 L = gate_logit_bound。
+
+这样可以防止 gate logit 无限变大，导致 sigmoid 饱和。
+
+接着计算 token gate：
+
+g_i = c(t) \cdot sigmoid(\bar{l}_i / \tau)
+
+其中：
+
+c(t) 是 gate cap schedule。
+\tau 是 gate temperature。
+
+再乘以 event occupancy mask：
+
+g_i = g_i \cdot 1[o_i > \epsilon]
+
+这一步的作用是：
+
+如果该 token 没有 event 支撑，则 gate 自动关闭。
+
+当前主配置中：
+
+gate_bias_init = -3.5
+gate_logit_bound = 6.0
+gate_temperature = 1.0
+gate_cap_start = 0.2
+gate_cap_final = 0.45
+gate_cap_warmup_steps = 1000
+
+这意味着：
+
+1. 初始 gate 偏小，避免训练一开始 event 污染 backbone。
+2. gate 最大值被 cap 限制，不能无限开大。
+3. gate cap 随训练逐渐 warmup，让 event 慢慢介入。
+
+--------------------------------------------------------------------------------
+6.3 Global event scale
+--------------------------------------------------------------------------------
+
+除了 token gate，BRG 还使用全局 event scale：
+
+s_e = s_{max} \cdot sigmoid(a)
+
+其中 a 是可学习参数。
+
+当前主配置：
+
+event_scale_init = 0.05
+event_scale_max = 0.20
+
+含义：
+
+1. event residual 初始幅度很小。
+2. 即使训练后，event residual 总体强度也被限制在 0.20 以内。
+3. event 的角色是 correction / residual，而不是重写 RGB backbone。
+
+--------------------------------------------------------------------------------
+6.4 Bounded residual 的意义
+--------------------------------------------------------------------------------
+
+如果直接让 event feature 大幅更新 RGB token，模型容易出现以下问题：
+
+1. 原本 MASt3R/Dark3R 的几何 prior 被破坏。
+2. DSEC/MVSEC 的局部场景先验被过拟合。
+3. event 噪声或拖影被放大。
+4. 深度出现像素感、块状、尺度漂移。
+
+bounded residual fusion 的设计使 event 只能以受限强度补充：
+
+F_i = R_i + small residual
+
+这样能够在低光区域借助 event，同时保持 RGB backbone 的稳定性。
+
+================================================================================
+7. Gate Regularization
+================================================================================
+
+仅仅有 token gate 还不够。如果不加约束，模型可能学到投机策略：
+
+1. 全图开 gate，把 event 当主要输入。
+2. 在没有 event 的区域也开 gate。
+3. gate logit 饱和，导致训练不稳定。
+4. 在某个数据集上过拟合 event 密度统计。
+
+因此 BRG 加入了 gate regularization。
+
+--------------------------------------------------------------------------------
+7.1 Mean gate regularization
+--------------------------------------------------------------------------------
+
+限制全图平均 gate 不要过大：
+
+L_{mean} = max(mean_i(g_i) - \bar{g}_{cap}, 0)^2
+
+当前主配置：
+
+gate_mean_cap_start = 0.05
+gate_mean_cap_final = 0.14
+gate_mean_cap_warmup_steps = 1000
+gate_mean_reg_weight = 1e-3
+
+含义：
+
+event 应该是局部补充，而不是全图替代 RGB。
+
+--------------------------------------------------------------------------------
+7.2 Low-event gate regularization
+--------------------------------------------------------------------------------
+
+在 event occupancy 很低的区域惩罚开 gate：
+
+L_{low} = mean(g_i^2 | o_i < o_{thr})
+
+当前主配置：
+
+low_event_occupancy_thr = 0.01
+gate_low_event_reg_weight = 1e-2
+
+含义：
+
+如果这个 token 没有足够 event evidence，就不应该让 event 分支影响 RGB token。
+
+这直接解决 scalar-g 的问题：scalar-g 无法在局部无 event 区域关掉自己。
+
+--------------------------------------------------------------------------------
+7.3 Gate logit regularization
+--------------------------------------------------------------------------------
+
+限制 gate logit 不要过度饱和：
+
+L_{logit} = mean(max(|l_i| - l_{bound}, 0)^2)
+
+当前主配置：
+
+logit_reg_bound = 4.0
+gate_logit_reg_weight = 1e-4
+
+含义：
+
+如果 logit 长期饱和，gate 会变成接近硬开关，不容易调整，也容易造成训练不稳定。这个正则让 gate 保持可学习和可解释。
+
+--------------------------------------------------------------------------------
+7.4 Channel deviation regularization
+--------------------------------------------------------------------------------
+
+代码中支持 channel modulation：
+
+g^c_i = 1 + \alpha tanh(MLP([R_i, E_i, r_i]))
+
+如果启用，会用：
+
+L_{channel} = mean((g^c_i - 1)^2)
+
+约束 channel-wise modulation 不要偏离 1 太多。
+
+当前主模型中：
+
+use_channel_modulation = false
+
+所以主模型没有使用 channel modulation，g^c_i = 1。
+
+--------------------------------------------------------------------------------
+7.5 Gate regularization 总结
+--------------------------------------------------------------------------------
+
+BRG 的辅助正则可以概括为：
+
+L_{gate} =
+\lambda_{mean} L_{mean}
++ \lambda_{low} L_{low}
++ \lambda_{logit} L_{logit}
++ \lambda_{channel} L_{channel}
+
+这个约束使 event gate 具备以下归纳偏置：
+
+1. sparse: 不全图乱开。
+2. reliability-aware: 低 event 区域少开。
+3. non-saturating: gate 不过早饱和。
+4. MASt3R-preserving: 不破坏 RGB backbone。
+
+================================================================================
+8. 可选 RGB Visibility / Structural Gate
+================================================================================
+
+代码中还支持 RGB visibility gate 和 structural gate，但当前 1k 主模型没有把它们作为主要贡献使用。
+
+RGB visibility confidence 会根据 RGB 图像局部曝光、contrast、gradient、high-frequency artifact proxy 计算一个可见性分数：
+
+v_i \in [0, 1]
+
+直觉是：
+
+1. RGB 很可靠时，event 可以少用。
+2. RGB 很暗或纹理不可见时，event 可以更多参与。
+
+Structural gate 会根据 event density 和 occupancy 判断 event 是否具有结构支撑，同时抑制极端 high-density hotspot。
+
+这些模块可以作为 future work 或后续 ablation，但当前主结果不依赖 VATS / dynamic bins。
+
+特别说明：
+
+我们测试过 visibility-aware temporal support，也就是根据 RGB visibility 动态使用 center 2/4/8 event bins 的想法。但当前 VATS300 在 dark005 下指标下降，因此不作为当前主线贡献。当前主模型仍然使用固定 8-channel event voxel。
+
+================================================================================
+9. 训练目标与 Loss 设计
+================================================================================
+
+当前主模型使用的训练目标不是单一 depth loss，而是多个弱约束组合，目标是：
+
+1. 让 event branch 学到有用几何信息。
+2. 不破坏 MASt3R/Dark3R 的 RGB geometry prior。
+3. 在有真实 depth_gt 的数据上校准 metric depth。
+4. 让 event 活动区域和预测深度边缘有一定一致性。
+
+总 loss 可以写成：
+
+L =
+\lambda_f L_{feat}
++ \lambda_s L_{struct}
++ \lambda_e L_{event-edge}
++ \lambda_d L_{depth}
++ L_{gate}
+
+当前主配置：
+
+feat_distill = 0.05
+structure_consistency = 0.05
+event_depth_edge = 0.04
+depth_gt = 2.0
+event_photo = 0.0
+pose_gt = 0.0
+
+--------------------------------------------------------------------------------
+9.1 Feature distillation loss
+--------------------------------------------------------------------------------
+
+目标：让 event-augmented student 的 token feature 不要偏离 frozen RGB teacher 太多。
+
+公式：
+
+L_{feat} = mean_i(1 - cos(normalize(f^S_i), normalize(f^T_i)))
+
+其中：
+
+f^S_i 是 Night3R student feature。
+f^T_i 是 frozen MASt3R/Dark3R teacher feature。
+
+作用：
+
+1. 保持预训练 RGB feature space。
+2. 避免 event branch 训练初期把 token 分布带偏。
+3. 让 event 作为补充，而不是重建整个 backbone。
+
+--------------------------------------------------------------------------------
+9.2 Structure consistency loss
+--------------------------------------------------------------------------------
+
+目标：让 student 的 3D 输出与 frozen teacher 的高置信结构保持一致。
+
+对 student 和 teacher 的 pts3d：
+
+P^S_i, P^T_i \in R^3
+
+在 teacher confidence 高、数值有限、点范数合理的区域计算：
+
+L_{struct} = mean_i log(1 + |(P^S_i - P^T_i) / scale|)
+
+其中 scale 使用 teacher 点范数的 median，并做 clamp。
+
+作用：
+
+1. 约束 student 不要偏离 MASt3R 已经学到的几何结构。
+2. 对严重 outlier 使用 log1p，避免梯度爆炸。
+3. 这是 consistency target，不是真 GT，所以权重较小。
+
+--------------------------------------------------------------------------------
+9.3 Event depth edge loss
+--------------------------------------------------------------------------------
+
+目标：让 event 活跃区域和预测深度边缘有相关性。
+
+先计算 event activity：
+
+A = \sum_c |E_c|
+
+再计算预测深度梯度：
+
+G = |\partial_x D| + |\partial_y D|
+
+对 A 和 G 做 z-normalization 后计算相关性：
+
+corr = mean(znorm(A) * znorm(G))
+
+loss：
+
+L_{event-edge} = 1 - clamp(corr, -1, 1)
+
+作用：
+
+1. event 通常响应亮度变化边缘，而几何深度边缘也常出现在物体边界。
+2. 该 loss 不强行要求所有 event 都对应深度边缘，而是弱相关约束。
+3. 可以增强 event 对局部结构边界的贡献。
+
+当前主配置中：
+
+event_depth_edge_source_weights:
+  mvsec: 1.0
+  dsec: 0.0
+  default: 1.0
+
+也就是说，主训练中 DSEC 不用这个 loss，避免在不稳定协议上引入错误梯度。
+
+--------------------------------------------------------------------------------
+9.4 Supervised depth GT loss
+--------------------------------------------------------------------------------
+
+当前使用真实 depth_gt 的监督，不接受 pseudo/teacher/external depth 作为 GT。
+
+使用 SILogLoss：
+
+L_{depth} = SILog(D_{pred}, D_{gt})
+
+作用：
+
+1. 校准 metric depth scale。
+2. 改善 raw AbsRel。
+3. 让模型不仅结构对，绝对尺度也更稳定。
+
+当前主配置：
+
+depth_gt = 2.0
+
+source weights：
+
+depth_gt_source_weights:
+  mvsec: 1.0
+  dsec: 0.0
+  default: 1.0
+
+说明：
+
+当前 1k 主模型主要是 MVSEC-only adaptation，因此 depth GT 对 MVSEC 起主要作用。DSEC 在这个配置里不使用 depth loss。
+
+--------------------------------------------------------------------------------
+9.5 Event photo consistency loss
+--------------------------------------------------------------------------------
+
+代码中支持 event_photo loss，但当前主模型中关闭：
+
+event_photo = 0.0
+
+其思路是：
+
+1. 根据预测深度和相机位姿，将第二帧 warp 到第一帧。
+2. 计算 log intensity change。
+3. 与 event voxel 的 polarity-summed event delta 做一致性约束。
+
+当前不作为主贡献，因为该项对 pose、曝光和 event alignment 较敏感，容易引入不稳定。
+
+--------------------------------------------------------------------------------
+9.6 Loss normalization
+--------------------------------------------------------------------------------
+
+训练中会根据 active loss weights 做归一化：
+
+L_{final} = L_{sum} / active_weight * target_weight
+
+这样做可以避免不同 batch 因为某些 loss 被 skip 而导致总 loss 尺度变化过大。
+
+================================================================================
+10. 训练策略
+================================================================================
+
+当前主模型训练策略是保守的 adapter-style fine-tuning。
+
+关键配置：
+
+freeze_teacher = true
+freeze_student_dark3r_stage1 = true
+partial_finetune_blocks = 0
+
+学习率：
+
+lr_event_encoder = 1e-6
+lr_fusion_adapter = 2e-6
+lr_dark3r = 0
+lr_head = 0
+
+训练设置：
+
+amp = true
+amp_dtype = bf16
+gradient_checkpointing = true
+warmup_steps = 150
+batch_size = 1
+
+这个策略的意义是：
+
+1. 保留 MASt3R/Dark3R 的 RGB 几何先验。
+2. 只训练 event encoder 和 fusion adapter，降低灾难性遗忘。
+3. 使用小学习率让 event 分支逐渐介入。
+4. 用 gate warmup 和 event scale cap 避免训练初期不稳定。
+
+当前主 checkpoint 是从已有较好模型继续做 MVSEC adaptation 得到：
+
+/data/fcr/data/Night3R/outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+================================================================================
+11. 与 MASt3R 的对比
+================================================================================
+
+当前重新按主协议做了 quick evaluation：
+
+输出目录：
+/data/fcr/data/Night3R/outputs/current_1k_vs_mast3r_quick_20260704
+
+协议：
+
+1. 同一 test root。
+2. 同一 fixed pairs。
+3. 同一 batch cache。
+4. 同一 depth_gt valid mask。
+5. 比较 MASt3R RGB-only 和 Night3R-1k RGB+real-event。
+6. 每个数据集 128 pairs。
+
+结果：
+
+| Model | Dataset | N | Raw AbsRel ↓ | Raw δ1 ↑ | Raw RMSElog ↓ | Raw PSNR ↑ | Median AbsRel ↓ | Median δ1 ↑ | Median PSNR ↑ |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MASt3R | DSEC-current | 128 | 0.5741 | 0.0008 | 0.8920 | 10.1206 | 0.0730 | 0.9535 | 22.4327 |
+| Night3R-1k | DSEC-current | 128 | 0.1356 | 0.8373 | 0.1716 | 21.4374 | 0.0559 | 0.9826 | 25.7260 |
+| MASt3R | MVSEC-current | 128 | 0.5880 | 0.1741 | 1.3317 | 20.2642 | 0.6417 | 0.2901 | 22.9044 |
+| Night3R-1k | MVSEC-current | 128 | 0.2073 | 0.8118 | 0.2808 | 30.1506 | 0.1949 | 0.8016 | 30.2916 |
+
+结论：
+
+1. 当前 1k 主模型不仅 median-aligned 指标更好，raw absolute depth 也明显优于 MASt3R。
+2. DSEC-current raw AbsRel 从 0.5741 降到 0.1356。
+3. MVSEC-current raw AbsRel 从 0.5880 降到 0.2073。
+4. 这说明 Night3R 不只是改善相对结构，也改善了低光场景下的 metric depth scale。
+
+需要注意：
+
+这是一版 128-pair quick evaluation，适合内部汇报和趋势判断。正式论文表格仍建议跑完整 test protocol，并固定脚本、随机种子和 test split。
+
+================================================================================
+12. Raw metrics 和 Median-aligned metrics 的含义
+================================================================================
+
+Raw metrics：
+
+直接比较预测深度和 GT 深度，不做任何尺度校正。
+
+Raw AbsRel:
+
+AbsRel_{raw} = mean(|D_{pred} - D_{gt}| / D_{gt})
+
+Raw 指标衡量的是：
+
+绝对尺度是否正确。
+
+Median-aligned metrics：
+
+先用有效像素的 median depth 对预测做整体 scale alignment：
+
+s = median(D_{gt}) / median(D_{pred})
+
+D'_{pred} = s D_{pred}
+
+再计算 AbsRel、delta1 等指标。
+
+Median-aligned 指标衡量的是：
+
+去掉全局尺度误差后，相对深度结构是否正确。
+
+推荐汇报方式：
+
+1. Raw AbsRel 作为主指标，因为它更严格，反映绝对尺度。
+2. Median-aligned AbsRel 作为辅助指标，反映几何结构。
+3. 如果 raw 和 median 都好，说明模型既有较好尺度，又有较好结构。
+4. 如果 raw 差但 median 好，说明结构好但 scale calibration 有问题。
+
+当前主模型 raw 和 median 都比 MASt3R 更好。
+
+================================================================================
+13. Event ablation: real / zero / shuffle
+================================================================================
+
+为了证明模型真的用了 event，而不是只靠 RGB 或数据集先验，需要做 event ablation。
+
+三种模式：
+
+1. real event
+使用真实 event voxel。
+
+2. zero event
+将 event voxel 置零。
+用于测试没有 event evidence 时模型表现。
+
+3. shuffle event
+保留 event value distribution，但对 event voxel 做空间 roll 和 channel roll，破坏 RGB/event alignment。
+用于测试模型是否依赖正确空间对齐的 event，而不是只依赖 event density 统计。
+
+当前 VATS300 no-darken 的 ablation 结果曾显示：
+
+MVSEC-current:
+real 0.2051
+shuffle 0.3382
+zero 0.6798
+
+MVSEC-old:
+real 0.2105
+shuffle 0.3094
+zero 0.7585
+
+DSEC-current:
+real 0.1366
+shuffle 0.1899
+zero 0.2193
+
+这类 ablation 的意义是：
+
+1. real 优于 zero：说明 event 输入有贡献。
+2. real 优于 shuffle：说明模型利用了 event 和 RGB 的空间对齐，而不只是 event 统计。
+3. zero 明显变差：说明 event branch 不是摆设。
+
+对于当前 1k 主模型，建议后续正式补齐同协议 real/zero/shuffle 表格。
+
+================================================================================
+14. Darken / dark005 低光协议
+================================================================================
+
+Night3R 的核心命题是低光/夜间，因此需要评估 darken 后的表现。
+
+dark005 协议：
+
+exposure_scale = 0.05
+
+即将 RGB 强制暗化到 5% 曝光，同时 event 输入保持不变。
+
+当前 1k 与 VATS300 的 dark005 quick eval：
+
+| Model | Dataset | Raw AbsRel ↓ | δ1 ↑ | RMSE log ↓ | Raw PSNR ↑ | Median AbsRel ↓ |
+|---|---|---:|---:|---:|---:|---:|
+| 1k_dark005 | dsec_current | 0.1866 | 0.5805 | 0.2434 | 18.6970 | 0.0937 |
+| 1k_dark005 | dsec_old | 0.1791 | 0.6392 | 0.2323 | 19.9821 | 0.1019 |
+| 1k_dark005 | mvsec_current | 0.2094 | 0.7334 | 0.2857 | 29.2776 | 0.1665 |
+| 1k_dark005 | mvsec_old_8scene16 | 0.1897 | 0.7767 | 0.2644 | 28.3185 | 0.1627 |
+| vats300_dark005 | dsec_current | 0.2193 | 0.4307 | 0.2925 | 17.5689 | 0.1145 |
+| vats300_dark005 | dsec_old | 0.2287 | 0.3735 | 0.2973 | 18.3218 | 0.1218 |
+| vats300_dark005 | mvsec_current | 0.2187 | 0.6941 | 0.2950 | 29.3495 | 0.1750 |
+| vats300_dark005 | mvsec_old_8scene16 | 0.1976 | 0.7577 | 0.2721 | 28.4199 | 0.1728 |
+
+结论：
+
+1. 当前主模型 1k 在 dark005 下比 VATS300 更稳。
+2. VATS / dynamic bins 暂时不作为主贡献。
+3. dark005 可以作为 Night3R 低光鲁棒性的主要测试协议之一。
+
+================================================================================
+15. 为什么当前方法比 MASt3R 更合理
+================================================================================
+
+MASt3R 是 RGB-only。
+
+在夜间低光下，RGB 输入存在局部不可见、噪声、模糊和过曝问题。MASt3R 只能依赖 RGB backbone 的先验，因此容易出现：
+
+1. 结构丢失。
+2. 边界不清。
+3. 尺度错误。
+4. 局部深度块状。
+5. 对暗部或光照异常区域的错误解释。
+
+Night3R 相比 MASt3R 的优势是：
+
+1. 增加 event branch，提供低光下仍可见的运动边缘和局部结构线索。
+2. 通过 event reliability statistics 判断 event 是否可靠。
+3. 通过 token-wise gate 局部决定是否使用 event。
+4. 通过 bounded residual 保护 MASt3R/Dark3R 的 RGB 几何先验。
+5. 通过 gate regularization 防止 event 过度介入。
+6. 通过 supervised depth GT 和 structure consistency 同时保证尺度与结构。
+
+因此可以这样表述：
+
+相比原版 MASt3R，Night3R 并不是简单增加 event 输入，而是提出了一种 reliability-aware bounded event residual fusion，使 event 在低光场景中以局部、受控、可解释的方式补充 RGB 几何特征，从而同时提升 raw metric depth 和 median-aligned geometric structure。
+
+================================================================================
+16. 当前不作为主线的方法
+================================================================================
+
+1. VATS / dynamic temporal bins
+
+想法：
+
+RGB 可见区域只使用 center 2/4 bins，极暗区域使用完整 8-channel event voxel。
+
+测试结果：
+
+VATS300 在 no-darken 下对 MVSEC 有小幅提升，但在 dark005 下四个协议都下降，尤其 DSEC 下降明显。
+
+原因判断：
+
+在真正极暗情况下，长时间 event support 反而很重要。过度压制 outer bins 会削弱 event 对低光区域的帮助。
+
+当前结论：
+
+不作为主贡献，可以作为 future work 或 negative ablation。
+
+2. Event photo loss
+
+代码支持，但当前主模型关闭。
+
+原因：
+
+该 loss 对 pose、曝光、event/RGB temporal alignment 比较敏感，当前容易引入不稳定。
+
+3. Strong channel modulation
+
+代码支持 channel-wise modulation，但当前主模型关闭。
+
+原因：
+
+当前我们更强调 token-level reliability gate 和 bounded residual，避免 event branch 拥有过强的 feature rewriting 能力。
+
+================================================================================
+17. 可以写进论文/汇报的贡献点
+================================================================================
+
+贡献 1：Night RGB-event reconstruction benchmark / protocol
+
+我们针对夜间/低光 RGB-event reconstruction 构建了系统性测试协议，包括：
+
+1. MVSEC night test。
+2. DSEC test。
+3. DL3DV cloudy/darken qualitative test。
+4. dark005 强低光协议。
+5. real / zero / shuffle event controls。
+6. raw 和 median-aligned 两套 depth metrics。
+
+贡献 2：Event token encoder for MASt3R/Dark3R
+
+我们不使用 event-to-image reconstruction，而是将 event voxel 直接 patchify 成 token，并复用 MASt3R/Dark3R encoder token architecture，使 event token 和 RGB token 在同一 token grid 和 feature dimension 下融合。
+
+贡献 3：Event reliability statistics
+
+提出局部 event reliability statistics：
+
+1. density
+2. occupancy
+3. polarity balance
+
+用于区分可靠 event 结构、稀疏噪声、hotspot、拖影和异常 polarity 响应。
+
+贡献 4：Bounded Reliability Gate
+
+提出 BRG，将 event 融合从 scalar global gate 改为 token-wise reliability-gated bounded residual：
+
+F_i = R_i + s_e g_i \Delta E_i
+
+该设计在引入 event 的同时保护 MASt3R/Dark3R 的 RGB geometry prior。
+
+贡献 5：Gate regularization
+
+通过 mean gate、low-event gate、logit bound 等约束，使 event gate 稀疏、可靠、非饱和，避免 event 分支全图污染 RGB backbone。
+
+贡献 6：实验证明
+
+在当前主协议中，Night3R-1k 相比 MASt3R 在 MVSEC-current 和 DSEC-current 上 raw AbsRel 和 median-aligned AbsRel 均明显更好。
+
+================================================================================
+18. 建议对学长的简短说明
+================================================================================
+
+学长，现在最新版主要不是简单加 event，而是把初版 Night3R 的 scalar-g 融合升级成了 reliability-aware bounded residual fusion。
+
+初版是全图共享一个 event gate，没法判断哪个局部 event 可靠。现在我们对每个 token 计算 event density、occupancy 和 polarity balance，再生成 token-level gate。这样 event 只在局部可靠区域参与融合。
+
+同时我们限制 event residual 的强度，用 event_scale、gate_cap 和 gate_mean_cap 保护 MASt3R/Dark3R 的 RGB 几何先验，防止 event 一旦学偏就污染 backbone。训练时还加了 gate regularization，惩罚全图乱开 gate、低 event 区域开 gate 和 logit 饱和。
+
+结果上，当前 1k 主模型相对 MASt3R 在 raw depth 上也明显更好。MVSEC-current raw AbsRel 从 0.588 降到 0.207，DSEC-current 从 0.574 降到 0.136；median-aligned 指标也同步提升。所以现在不是只靠尺度对齐后的结构指标，绝对尺度也有明显改善。
+
+================================================================================
+19. 关键文件路径
+================================================================================
+
+当前主配置：
+/data/fcr/data/Night3R/config/train_night3r_mvsec_only_adapt_1k_from_best.yaml
+
+当前主权重：
+/data/fcr/data/Night3R/outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+Event voxel:
+/data/fcr/data/Night3R/dataset/event_voxel.py
+
+Event token encoder:
+/data/fcr/data/Night3R/model/event_encoder.py
+
+BRG fusion:
+/data/fcr/data/Night3R/model/event_fusion.py
+
+Event student wrapper:
+/data/fcr/data/Night3R/model/event_dark3r_student.py
+
+训练入口：
+/data/fcr/data/Night3R/train_event_dark3r.py
+
+当前 MASt3R vs Night3R quick eval：
+/data/fcr/data/Night3R/outputs/current_1k_vs_mast3r_quick_20260704/summary.md
+
+dark005 eval：
+/data/fcr/data/Night3R/outputs/dark005_real_quick_1k_vs_vats300_20260703/summary.md
+
+================================================================================
+20. 当前最稳的论文表述
+================================================================================
+
+可以写：
+
+We propose Night3R, a low-light RGB-event reconstruction framework built upon MASt3R/Dark3R. Instead of directly replacing RGB features with event features, Night3R introduces a reliability-aware bounded event residual adapter. The adapter computes token-level event reliability from local event density, occupancy, and polarity balance, and uses a bounded gate to inject event residuals only where reliable. This preserves the pretrained RGB geometric prior while exploiting event cues in low-light regions.
+
+中文解释：
+
+我们提出 Night3R，一个基于 MASt3R/Dark3R 的低光 RGB-event reconstruction 框架。Night3R 不直接用 event 替换 RGB feature，而是引入 reliability-aware bounded event residual adapter。该模块根据局部 event density、occupancy 和 polarity balance 计算 token-level event reliability，并用有界 gate 只在可靠区域注入 event residual。这样既保留了预训练 RGB 几何先验，又能在低光区域利用 event 结构线索。
+
+================================================================================
+21. 当前需要补充的正式实验
+================================================================================
+
+为了让论文更稳，建议后续补齐：
+
+1. 当前 1k 主模型的 full test set MASt3R vs Night3R 表。
+2. 当前 1k 主模型的 real / zero / shuffle event ablation。
+3. scalar-g 初版 Night3R vs current BRG Night3R 的同协议 ablation。
+4. BRG without gate regularization。
+5. BRG without event reliability statistics。
+6. dark005 下 MASt3R vs Night3R 的完整表。
+7. qualitative panels：MASt3R dark RGB、Night3R real event、zero/shuffle event。
+
+其中最重要的是：
+
+1. MASt3R vs Night3R。
+2. scalar-g vs BRG。
+3. real vs zero vs shuffle。
+
+这三组可以直接支撑论文的主要 claim。
+
+================================================================================
+22. 补充说明：Bounded Residual 和 Gate Regularization 的改动
+================================================================================
+
+4. Bounded residual 和 gate regularization
+
+前面虽然说了 s_event，但还需要强调我们不是简单多乘了一个 scale，而是把 event residual 的影响范围显式限制住了。之前 scalar-g 如果学大了，event 会全图影响 RGB feature，容易破坏 MASt3R 原本的几何先验；如果学小了，event 又几乎不起作用。
+
+现在我们给 event 融合加了几个上限约束，比如 event_scale_max、gate_cap 和 gate_mean_cap。event_scale_max 限制 event residual 的整体强度，gate_cap 限制单个 patch token 的最大 event 注入量，gate_mean_cap 限制整张图平均使用 event 的程度。这样 event 只能作为受控的 residual correction，而不能大幅重写 RGB backbone。
+
+同时我们还加了 gate regularization，惩罚三类情况：第一是平均 gate 太大，防止模型全图乱用 event；第二是低 occupancy 区域 gate 太大，防止没有 event 支撑的地方也引入 event；第三是 gate logit 过度饱和，防止 gate 变成不可调的硬开关。这个改动让 event 的使用更加稀疏、局部、可控。

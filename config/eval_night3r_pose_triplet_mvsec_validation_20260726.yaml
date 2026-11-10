@@ -1,0 +1,7 @@
+_base_: train_night3r_final_step100_pose_adapt100.yaml
+
+# Evaluation must discover the dedicated validation clips. They remain excluded
+# by the training configuration and are never supplied to the triplet trainer.
+dataset:
+  root: "/data/fcr/data/train_data/MVSEC"
+  exclude_scenes: []

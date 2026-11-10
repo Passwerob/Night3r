@@ -1,0 +1,93 @@
+_base_: train_night3r_mvsec_only_adapt_1k_from_best.yaml
+
+# Deliberate one-pair local fit for a qualitative effect check. This checkpoint
+# is not a held-out benchmark model and must not replace the final Night3R model.
+dataset:
+  root: "/data/fcr/data/Night3R/outputs/mvsec003_local_ft10_20260726/train_data"
+  image_size: [512, 512]
+  pair_stride: 1
+  pair_sampling: "fixed"
+  min_pair_distance: 1
+  max_pair_distance: 1
+  allow_reverse_pairs: false
+  max_scenes: 1
+  max_pairs_per_scene: 1
+  num_workers: 0
+
+# The training root already contains the fixed native-resolution darkened RGB.
+lowlight_aug:
+  enabled: false
+
+# Keep the residual coefficient identical during this 10-step fit and inference.
+# A warmup schedule is inappropriate when the entire run is shorter than the
+# original 1k-step gate-cap warmup.
+brg:
+  gate_cap_start: 0.45
+  gate_cap_final: 0.45
+  gate_cap_warmup_steps: 0
+  gate_mean_cap_start: 0.14
+  gate_mean_cap_final: 0.14
+  gate_mean_cap_warmup_steps: 0
+
+loss:
+  dark3r_original: 0.0
+  descriptor_distill: 0.0
+  feat_distill: 0.0
+  structure_consistency: 0.0
+  event_depth_edge: 0.0
+  event_photo: 0.0
+  depth_gt: 2.0
+  depth_gt_source_weights:
+    mvsec: 1.0
+    default: 1.0
+  pseudo_depth: 0.0
+  depth_gradient_gt: 0.0
+  pose_gt: 0.0
+  pose_cycle: 0.0
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 20.0
+
+training:
+  stage: 0
+  num_epochs: 12
+  batch_size: 1
+  symmetric_pairs: true
+  balanced_dataset_sampling: false
+  pose_head_only: false
+  descriptor_head_only: false
+  geometry_head_only: false
+  checkpoint_mode: "full"
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: true
+  grad_clip_norm: 1.0
+  save_every_steps: 10
+  save_optimizer_state: false
+  save_every_epoch: false
+  warmup_steps: 0
+  warmup_start_factor: 1.0
+  lr_event_encoder: 5.0e-6
+  lr_fusion_adapter: 1.0e-5
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  lr_pose_head: 0.0
+  stages:
+    - name: "mvsec003_local_event_fit"
+      stage: 0
+      num_epochs: 12
+      partial_finetune_blocks: 0
+      warmup_steps: 0
+      warmup_start_factor: 1.0
+      lr_event_encoder: 5.0e-6
+      lr_fusion_adapter: 1.0e-5
+      lr_dark3r: 0.0
+      lr_head: 0.0
+      lr_pose_head: 0.0
+
+eval:
+  every_epochs: 0
+  batch_size: 1
+  num_workers: 0
+  max_batches: 1

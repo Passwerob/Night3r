@@ -1,0 +1,7 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Preserve random exposure darkening but remove synthetic shot/read noise.
+lowlight_aug:
+  read_noise_std: 0.0
+  shot_noise: false
+

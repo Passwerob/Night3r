@@ -1,0 +1,10 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Conventional same-grid concatenation baseline. The shared RGB backbone and
+# event encoder use the same checkpoint as BRG; this fusion head is new.
+fusion:
+  fusion_type: "concat_mlp"
+  use_density_film: false
+  hidden_dim: 1536
+  event_scale_init: 0.035
+

@@ -1,0 +1,9 @@
+_base_: train_night3r_dl3dv_da3_pseudo_ft1k_20260722.yaml
+
+# These held-out DA3 clips showed unstable inter-window scale correction and
+# are excluded from teacher-agreement scoring. They remain archived for audit.
+dataset:
+  exclude_scenes:
+    - screen-000087
+    - screen-000098
+    - screen-000130

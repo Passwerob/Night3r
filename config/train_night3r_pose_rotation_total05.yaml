@@ -1,0 +1,9 @@
+_base_: train_night3r_pose_head_sweep_5k.yaml
+
+# Near identity, chordal SO(3) distance is approximately the rotation angle.
+loss:
+  pose_rotation_weight: 1.0
+  pose_rotation_chordal_weight: 4.0
+
+training:
+  save_every_steps: 400

@@ -1,0 +1,52 @@
+_base_: train_night3r_da3_joint_mvsec_dsec_dl3dv_ft1k_20260722.yaml
+
+# Repair native XYZ point maps without reopening the pretrained RGB backbone
+# or geometry heads. The frozen MASt3R teacher constrains both output views,
+# while the existing metric/pseudo-depth terms preserve the current Z-depth.
+loss:
+  structure_consistency: 0.05
+  structure_conf_thr: 1.0
+  structure_min_scale: 1.0
+  structure_max_scale: 1000.0
+  structure_max_point_norm: 10000.0
+  structure_max_residual: 20.0
+  structure_min_valid_fraction: 0.01
+
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 20.0
+
+training:
+  stage: 0
+  symmetric_pairs: true
+  batch_size: 1
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: true
+  grad_clip_norm: 1.0
+  save_every_epoch: false
+  save_every_steps: 100
+  warmup_steps: 50
+  warmup_start_factor: 0.05
+  lr_event_encoder: 2.5e-7
+  lr_fusion_adapter: 5.0e-7
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  stages:
+    - name: "xyz_repair_joint_stage0"
+      stage: 0
+      num_epochs: 2
+      partial_finetune_blocks: 0
+      warmup_steps: 50
+      warmup_start_factor: 0.05
+      lr_event_encoder: 2.5e-7
+      lr_fusion_adapter: 5.0e-7
+      lr_dark3r: 0.0
+      lr_head: 0.0
+
+eval:
+  every_epochs: 0
+  batch_size: 1
+  num_workers: 0
+  max_batches: 0

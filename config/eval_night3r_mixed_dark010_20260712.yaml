@@ -1,0 +1,11 @@
+_base_: train_night3r_brg_dl3dv_recover_from_stage2.yaml
+
+# Evaluation-only ultra-dark protocol. RGB is degraded at a fixed exposure;
+# the recorded event voxel is left unchanged.
+lowlight_aug:
+  enabled: true
+  min_exposure: 0.01
+  max_exposure: 0.01
+  read_noise_std: 0.01
+  shot_noise: true
+  gamma_space_input: true

@@ -1,0 +1,86 @@
+_base_: train_night3r_mvsec_only_adapt_1k_from_best.yaml
+
+# DA3 is an external teacher. Its predictions live under depth_pseudo/ and are
+# never treated as sensor/dataset ground truth.
+dataset:
+  root: "/data/fcr/data/train_data/DL3DV_DA3_pseudo_v1"
+  pair_sampling: "random"
+  min_pair_distance: 1
+  max_pair_distance: 3
+  allow_reverse_pairs: true
+  max_scenes: null
+  max_pairs_per_scene: null
+  num_workers: 4
+
+# DA3 sees the original clean DL3DV frames. Night3R receives a low-light
+# version of the same frame while preserving the registered event stream.
+lowlight_aug:
+  enabled: true
+  apply_sources: ["dl3dv"]
+  min_exposure: 0.004
+  max_exposure: 0.05
+  read_noise_std: 1.0e-5
+  shot_noise: true
+  shot_noise_std: 5.0e-5
+  gamma_space_input: true
+
+loss:
+  dark3r_original: 0.0
+  descriptor_distill: 0.0
+  feat_distill: 0.0
+  structure_consistency: 0.0
+  event_depth_edge: 0.0
+  event_photo: 0.0
+  depth_gt: 0.0
+  depth_gradient_gt: 0.0
+  pose_gt: 0.0
+  pose_cycle: 0.0
+
+  pseudo_depth: 0.25
+  pseudo_depth_source_weights:
+    dl3dv: 1.0
+    default: 0.0
+  pseudo_depth_confidence_percentile: 40.0
+  pseudo_depth_huber_delta: 0.1
+  pseudo_depth_min_valid_fraction: 0.05
+
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 100.0
+
+training:
+  stage: 0
+  num_epochs: 2
+  batch_size: 1
+  symmetric_pairs: false
+  balanced_dataset_sampling: false
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: true
+  grad_clip_norm: 1.0
+  save_every_epoch: false
+  save_every_steps: 250
+  warmup_steps: 150
+  warmup_start_factor: 0.05
+  lr_event_encoder: 1.0e-6
+  lr_fusion_adapter: 2.0e-6
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  stages:
+    - name: "dl3dv_da3_pseudo_ft1k_stage0"
+      stage: 0
+      num_epochs: 2
+      partial_finetune_blocks: 0
+      warmup_steps: 150
+      warmup_start_factor: 0.05
+      lr_event_encoder: 1.0e-6
+      lr_fusion_adapter: 2.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0
+
+eval:
+  every_epochs: 0
+  batch_size: 1
+  num_workers: 0
+  max_batches: 32

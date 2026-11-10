@@ -1,0 +1,29 @@
+_base_: train_night3r_pose_head_mvsec_dl3dv_3k.yaml
+
+# The frozen event pathway already completed its gate-cap schedule. Keeping the
+# cap fixed avoids replaying that curriculum when the continuation step resets.
+brg:
+  gate_cap_start: 0.45
+  gate_cap_final: 0.45
+  gate_cap_warmup_steps: 0
+  gate_mean_cap_start: 0.14
+  gate_mean_cap_final: 0.14
+  gate_mean_cap_warmup_steps: 0
+
+training:
+  pose_head_only: true
+  warmup_steps: 100
+  warmup_start_factor: 0.1
+  lr_pose_head: 1.0e-4
+  stages:
+    - name: "pose_head_continuation"
+      stage: 0
+      num_epochs: 2
+      partial_finetune_blocks: 0
+      warmup_steps: 100
+      warmup_start_factor: 0.1
+      lr_event_encoder: 0.0
+      lr_fusion_adapter: 0.0
+      lr_dark3r: 0.0
+      lr_head: 0.0
+      lr_pose_head: 1.0e-4

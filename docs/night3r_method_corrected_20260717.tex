@@ -1,0 +1,506 @@
+\section{Method}
+\label{sec:method}
+\input{images_tex/pipeline}
+
+\subsection{Overview}
+\label{sec:method:overview}
+
+We propose \ourMethod{}, a feed-forward framework for pairwise 3D
+reconstruction from low-light RGB images and temporally aligned event streams.
+The framework preserves the encoder--decoder interface of a pretrained
+MASt3R model~\cite{dust3r_cvpr24,mast3r_eccv24} and introduces a separate event
+encoder together with a Bounded Reliability Gate (BRG).  The RGB encoder
+remains the primary geometry pathway.  Event features are injected once, after
+the two per-view encoders and before the pretrained cross-view decoder, as
+small token-wise residuals.
+
+For each view, the event encoder maps an eight-channel polarity-separated
+voxel grid to the same spatial token grid and feature dimension as the RGB
+encoder.  BRG derives a scalar gate for every token from local event activity,
+occupancy, and polarity statistics.  A scheduled gate cap and a bounded global
+event scale constrain the coefficient of each event residual.  The fused token
+pair is then processed by the original cross-view decoder and prediction heads,
+which produce dense point maps, point confidence, local descriptors, and
+descriptor confidence.
+
+During training, a frozen RGB-only model provides descriptor and point-map
+consistency targets.  The teacher receives the stored source RGB pair before
+online low-light degradation, whereas the event student receives the degraded
+pair.  For native nighttime data on which additional degradation is disabled,
+the two branches receive the same RGB pair and differ only in the event path.
+Metric depth, depth-gradient, event-edge, and event-photometric terms are
+enabled according to the metadata available in each source.  Their active
+weights are normalized to keep the objective scale comparable across sources.
+At inference time, the teacher and all losses are removed.
+
+The overall architecture is illustrated in \cref{fig:pipeline}.
+
+
+\subsection{Problem Formulation and Input Construction}
+\label{sec:method:formulation}
+
+\noindent\textbf{Pairwise point-map prediction.}
+Let
+$\mathcal{I}^{\ell}=(I_1^{\ell},I_2^{\ell})$ be a low-light RGB pair and
+$\mathcal{V}=(\mathbf{V}_1,\mathbf{V}_2)$ the corresponding event voxels.
+The student predicts
+\begin{equation}
+\mathcal{O}_{S}=f_{\theta}(\mathcal{I}^{\ell},\mathcal{V})
+=\left\{
+\hat{\mathbf{X}}_{S}^{v,1},
+\hat{\mathbf{C}}_{S}^{v,1},
+\hat{\mathbf{D}}_{S}^{v},
+\hat{\mathbf{Q}}_{S}^{v}
+\right\}_{v\in\{1,2\}}.
+\label{eq:student_outputs}
+\end{equation}
+Following DUSt3R and MASt3R, both point maps are expressed in the coordinate
+frame of the first camera.  Thus,
+$\hat{\mathbf{X}}_{S}^{1,1}$ is the point map of the first image and
+$\hat{\mathbf{X}}_{S}^{2,1}$, implemented as
+\texttt{pts3d\_in\_other\_view}, is the point map of the second image expressed
+in the first-view frame.  The remaining outputs are point confidence
+$\hat{\mathbf{C}}$, dense matching descriptor $\hat{\mathbf{D}}$, and
+descriptor confidence $\hat{\mathbf{Q}}$.
+
+\vspace{+5pt}
+\noindent\textbf{Event voxelization.}
+An event is represented as
+$e_k=(x_k,y_k,t_k,p_k)$, where $p_k\in\{-1,+1\}$.  For the events selected in
+one temporal window, we normalize timestamps using the first and last event in
+that window,
+\begin{equation}
+t_k^{*}
+=(B-1)\frac{t_k-t_{\min}}{t_{\max}-t_{\min}+\epsilon}.
+\label{eq:event_time_normalization}
+\end{equation}
+With $\kappa(a)=\max(0,1-|a|)$, temporal bilinear accumulation gives
+\begin{equation}
+\mathbf{V}^{p}(b,x,y)
+=\sum_{k:p_k=p}
+\delta_{x,x_k}\delta_{y,y_k}\kappa(b-t_k^{*}),
+\qquad b\in\{0,\ldots,B-1\}.
+\label{eq:event_voxelization}
+\end{equation}
+We use $B=4$ bins per polarity and stack the positive bins before the negative
+bins, yielding
+$\mathbf{V}\in\mathbb{R}^{8\times H\times W}$.  Before entering the event
+encoder, the adapter applies signed logarithmic compression and normalizes only
+nonzero entries,
+\begin{equation}
+\overline{\mathbf{V}}
+=\operatorname{NZNorm}\!\left(
+\operatorname{sign}(\mathbf{V})\log(1+|\mathbf{V}|)
+\right),
+\label{eq:event_voxel_normalization}
+\end{equation}
+so empty pixels remain zero.  Local gate statistics, defined below, are
+computed from the input voxel before this adapter-side compression.
+
+Native-event datasets are converted to the same per-frame voxel format before
+training.  For DL3DV, which does not contain native events, we first densify the
+RGB sequence with P-RIFE and then simulate the event stream using
+DVS-Voltmeter.  The simulated stream is partitioned into frame-associated
+windows and voxelized with the same eight-channel contract.  This simulation
+is an offline data-preparation step and is not used at inference time.
+
+\vspace{+5pt}
+\noindent\textbf{Online low-light degradation.}
+For sources on which synthetic darkening is enabled, the stored RGB image
+$I^{o}\in[0,1]$ is mapped to an approximate linear domain and degraded as
+\begin{align}
+I^{\mathrm{lin}} &= (I^{o})^{\gamma}, \qquad \gamma=2.2, \\
+\widetilde I^{\mathrm{lin}}
+&=eI^{\mathrm{lin}}
++\sigma_s\sqrt{eI^{\mathrm{lin}}+\epsilon}\,\xi_s
++\sigma_r\xi_r, \\
+I^{\ell}
+&=\operatorname{clip}(\widetilde I^{\mathrm{lin}},0,1)^{1/\gamma},
+\label{eq:lowlight_degradation}
+\end{align}
+where $\log e$ is sampled uniformly between the configured exposure bounds and
+$\xi_s,\xi_r\sim\mathcal{N}(0,1)$.  This is an approximate linear-RGB exposure
+model with signal-dependent Gaussian shot noise and additive Gaussian read
+noise; it is not a claim of processing true camera RAW data.  For real
+nighttime adaptation, this augmentation can be disabled, in which case
+$I^{\ell}=I^{o}$.
+
+
+\subsection{Reliability-Aware Event Residual Adaptation}
+\label{sec:method:event_integration}
+
+For clarity, this subsection omits the view index; the same per-view operation
+is applied to both inputs.
+
+\noindent\textbf{Event token encoder.}
+The pretrained image encoder produces
+\begin{equation}
+\mathbf{Z}^{I}=\Phi_I(I^{\ell})
+\in\mathbb{R}^{N\times d}.
+\label{eq:image_tokens}
+\end{equation}
+The event voxel is patchified by a convolution whose kernel and stride match
+the image patch size.  The resulting tokens are processed by a separate copy
+of the pretrained image-encoder blocks,
+\begin{equation}
+\mathbf{Z}^{E}=\Phi_E(\overline{\mathbf{V}})
+\in\mathbb{R}^{N\times d}.
+\label{eq:event_tokens}
+\end{equation}
+The copied blocks are trainable, but their architecture and positional token
+grid match those of the RGB encoder.  No event-to-image reconstruction is
+performed.
+
+\vspace{+5pt}
+\noindent\textbf{Local event statistics.}
+\input{images_tex/brg_gate}
+Let $\Omega_i$ be the pixels represented by token $i$.  At pixel
+$\mathbf{p}=(x,y)$, define
+\begin{align}
+a(\mathbf{p})
+&=\sum_{c=1}^{2B}|\mathbf{V}_{c}(\mathbf{p})|, \\
+a^{+}(\mathbf{p})
+&=\sum_{b=0}^{B-1}|\mathbf{V}^{+}_{b}(\mathbf{p})|, \\
+a^{-}(\mathbf{p})
+&=\sum_{b=0}^{B-1}|\mathbf{V}^{-}_{b}(\mathbf{p})|.
+\end{align}
+We compute three pixel-wise maps and average-pool them to the event-token grid:
+\begin{equation}
+\mathbf{r}_{i}=
+\begin{bmatrix}
+\displaystyle
+\frac{1}{|\Omega_i|}
+\sum_{\mathbf{p}\in\Omega_i}\log(1+a(\mathbf{p})) \\[8pt]
+\displaystyle
+\frac{1}{|\Omega_i|}
+\sum_{\mathbf{p}\in\Omega_i}\mathbb{I}[a(\mathbf{p})>0] \\[8pt]
+\displaystyle
+\frac{1}{|\Omega_i|}
+\sum_{\mathbf{p}\in\Omega_i}
+\frac{|a^{+}(\mathbf{p})-a^{-}(\mathbf{p})|}
+{a^{+}(\mathbf{p})+a^{-}(\mathbf{p})+\epsilon}
+\end{bmatrix}.
+\label{eq:reliability_statistics}
+\end{equation}
+The entries are log activity, occupancy, and polarity imbalance.  In
+particular, activity and polarity are computed per pixel before pooling; they
+are not obtained by first summing the whole token region.  We normalize the
+statistics as
+\begin{equation}
+\hat{\mathbf{r}}_i
+=\boldsymbol{\gamma}\odot
+\operatorname{clip}\!\left(
+\frac{\mathbf{r}_i-\boldsymbol{\mu}}
+{\boldsymbol{\sigma}+10^{-4}},-K,K
+\right)+\boldsymbol{\beta},
+\label{eq:event_stat_normalization}
+\end{equation}
+where $\boldsymbol{\mu}$ and $\boldsymbol{\sigma}$ are configured statistic
+moments.  The affine parameters $\boldsymbol{\gamma},\boldsymbol{\beta}$ are
+learned.  Dataset-specific event-rate differences are handled by the learned
+source gate bias in \cref{eq:gate_logit}, rather than by changing the event
+content branch.
+
+\vspace{+5pt}
+\noindent\textbf{Bounded Reliability Gate.}
+The event content and its reliability coefficient are computed separately:
+\begin{align}
+\Delta\mathbf{Z}^{E}
+&=\phi_r\!\left(\operatorname{LN}(\mathbf{Z}^{E})\right),
+\label{eq:event_residual}\\
+\ell_i
+&=\phi_g(\hat{\mathbf{r}}_i)+\beta_s,
+\label{eq:gate_logit}
+\end{align}
+where $\phi_r$ is a two-layer MLP, $\phi_g$ is a lightweight gate MLP, and
+$\beta_s$ is a learned source bias when source conditioning is enabled.  The
+raw logit is smoothly bounded and converted to a scheduled token gate,
+\begin{align}
+\bar\ell_i
+&=L\tanh(\ell_i/L), \\
+g_i(u)
+&=c(u)\,\sigma(\bar\ell_i/\tau)\,
+\mathbb{I}[o_i>\epsilon_o],
+\label{eq:bounded_reliability_gate}
+\end{align}
+where $o_i$ is the occupancy entry of $\mathbf{r}_i$, $c(u)$ is linearly
+scheduled from an initial to a final gate cap, and $\tau$ is the gate
+temperature.  A second sigmoid parameterization bounds the global event scale,
+\begin{equation}
+s_e=s_{\max}\sigma(a).
+\label{eq:event_global_scale}
+\end{equation}
+With channel modulation disabled in the reported model, fusion is
+\begin{equation}
+\widetilde{\mathbf{Z}}^{I}_{i}
+=\mathbf{Z}^{I}_{i}
++s_e g_i(u)\Delta\mathbf{Z}^{E}_{i}.
+\label{eq:gated_fusion}
+\end{equation}
+Therefore the scalar coefficient multiplying each event residual is bounded by
+$s_{\max}c(u)$.  The bound constrains the residual coefficient, not the norm of
+$\Delta\mathbf{Z}^{E}_{i}$ itself.
+
+BRG contains no RGB--event cross-attention.  The residual
+$\Delta\mathbf{Z}^{E}$ depends on the event token, while its gate depends on
+event statistics.  Cross-view interactions occur only after fusion, when the
+frozen MASt3R decoder processes the two adapted view-token sequences,
+\begin{equation}
+\mathcal{O}_{S}
+=\Psi\!\left(
+\widetilde{\mathbf{Z}}^{I}_{1},
+\widetilde{\mathbf{Z}}^{I}_{2}
+\right).
+\label{eq:adapted_prediction}
+\end{equation}
+The scalar gated cross-attention module is retained only as an experimental
+baseline and is not part of the final BRG architecture.
+
+
+\subsection{Frozen RGB Geometry Guidance}
+\label{sec:method:distillation}
+
+Let $\mathcal{I}^{o}=(I_1^{o},I_2^{o})$ denote the stored source RGB pair before
+online low-light degradation.  A frozen RGB-only teacher predicts
+\begin{equation}
+\mathcal{O}_{T}
+=f_{\theta_T}(\mathcal{I}^{o})
+=\left\{
+\hat{\mathbf{X}}_{T}^{v,1},
+\hat{\mathbf{C}}_{T}^{v,1},
+\hat{\mathbf{D}}_{T}^{v},
+\hat{\mathbf{Q}}_{T}^{v}
+\right\}_{v\in\{1,2\}}.
+\label{eq:teacher_prediction}
+\end{equation}
+The teacher pair and student pair correspond pixel-wise because the latter is
+obtained from the former by photometric degradation.  The source pair is
+well-exposed for synthetic low-light sources but is not assumed to be
+well-exposed for native nighttime datasets.  Teacher parameters and outputs
+are detached throughout training.
+
+\vspace{+5pt}
+\noindent\textbf{Dense descriptor distillation.}
+We align the final dense descriptor maps returned by the MASt3R heads rather
+than collecting intermediate decoder activations.  Let
+$\mathcal{P}^{D}_{v}$ be locations where both student and teacher descriptors
+are finite.  The descriptor loss is
+\begin{equation}
+\mathcal{L}_{\mathrm{desc}}
+=\frac{1}{2}\sum_{v=1}^{2}
+\frac{1}{|\mathcal{P}^{D}_{v}|}
+\sum_{\mathbf{p}\in\mathcal{P}^{D}_{v}}
+\left[
+1-\operatorname{cos}\!\left(
+\hat{\mathbf{D}}_{S}^{v}(\mathbf{p}),
+\operatorname{sg}(\hat{\mathbf{D}}_{T}^{v}(\mathbf{p}))
+\right)
+\right].
+\label{eq:descriptor_distillation}
+\end{equation}
+
+\vspace{+5pt}
+\noindent\textbf{Confidence-masked point-map consistency.}
+For view $v$, we retain finite teacher/student points whose teacher confidence
+exceeds $\tau_c$ and whose point norms remain below a fixed outlier threshold.
+The valid set is denoted $\mathcal{P}^{X}_{v}$.  A robust scale is estimated
+\emph{separately for each view},
+\begin{equation}
+s_{T,v}
+=\operatorname{clip}\!\left(
+\operatorname*{median}_{\mathbf{p}\in\mathcal{P}^{X}_{v}}
+\left\|
+\hat{\mathbf{X}}_{T}^{v,1}(\mathbf{p})
+\right\|_2,
+s_{\min},s_{\max}
+\right).
+\label{eq:teacher_geometry_scale}
+\end{equation}
+For coordinate $c\in\{1,2,3\}$, define the clipped normalized residual
+\begin{equation}
+r_{v,\mathbf{p},c}
+=\operatorname{clip}\!\left(
+\frac{
+[\hat{\mathbf{X}}_{S}^{v,1}(\mathbf{p})
+-\operatorname{sg}(\hat{\mathbf{X}}_{T}^{v,1}(\mathbf{p}))]_c
+}{s_{T,v}},
+-r_{\max},r_{\max}
+\right).
+\end{equation}
+The implemented structure-consistency penalty is
+\begin{equation}
+\mathcal{L}_{\mathrm{struct}}
+=\frac{1}{|\mathcal{V}_{X}|}
+\sum_{v\in\mathcal{V}_{X}}
+\underset{\substack{
+\mathbf{p}\in\mathcal{P}^{X}_{v}\\c\in\{1,2,3\}
+}}{\operatorname{mean}}
+\log(1+|r_{v,\mathbf{p},c}|),
+\label{eq:pointmap_consistency_loss}
+\end{equation}
+where $\mathcal{V}_{X}$ contains views with enough valid support.  This is a
+bounded-influence consistency target rather than metric ground truth.  We use
+the $\log(1+|r|)$ penalty to suppress the influence of severe point outliers.
+
+
+\subsection{Source-Aware Training Objective}
+\label{sec:method:training_obj}
+
+\noindent\textbf{Active-weight normalization.}
+Let
+\begin{equation}
+\mathcal{K}
+=\{\mathrm{desc},\mathrm{struct},\mathrm{edge},\mathrm{photo},
+\mathrm{depth},\mathrm{grad},\mathrm{gate}\}
+\end{equation}
+be the training objectives.  For a batch $\mathcal{B}$ from source $s$,
+the effective component weight is
+\begin{equation}
+w_k(\mathcal{B})
+=a_k(\mathcal{B})\,\alpha_{s,k}\lambda_k,
+\label{eq:effective_loss_weight}
+\end{equation}
+where $a_k$ records whether the required tensors and valid pixels are present,
+$\alpha_{s,k}$ is the configured source factor, and $\lambda_k$ is the base
+weight.  The loss is normalized by the sum of weights of components that were
+actually evaluated,
+\begin{equation}
+\mathcal{L}_{\mathrm{train}}(\mathcal{B})
+=\frac{\lambda_{\mathrm{target}}}
+{\sum_{k\in\mathcal{K}}w_k(\mathcal{B})+\epsilon}
+\sum_{k\in\mathcal{K}}
+w_k(\mathcal{B})\mathcal{L}_k.
+\label{eq:dynamic_loss}
+\end{equation}
+In the default configuration $\lambda_{\mathrm{target}}=1$.  Source factors
+set unsupported terms to zero; for example, DL3DV does not receive metric-depth
+supervision, while event-photometric supervision is used only for sources with
+valid intrinsics and relative pose.
+
+\vspace{+5pt}
+\noindent\textbf{Metric depth supervision.}
+We apply metric depth supervision to the first-view prediction using the $z$
+coordinate of
+$\hat{\mathbf{X}}_{S}^{1,1}$,
+\begin{equation}
+\hat D_1(\mathbf{p})
+=\left[\hat{\mathbf{X}}_{S}^{1,1}(\mathbf{p})\right]_z,
+\end{equation}
+and valid measured depth $D_1^{\mathrm{gt}}$.  With
+$d(\mathbf{p})=\log\hat D_1(\mathbf{p})-\log D_1^{\mathrm{gt}}(\mathbf{p})$,
+the implemented SILog loss is
+\begin{equation}
+\mathcal{L}_{\mathrm{depth}}
+=10\sqrt{
+\operatorname{Var}_{\mathcal{P}^{D}}[d]
++\beta\left(
+\operatorname{Mean}_{\mathcal{P}^{D}}[d]
+\right)^2
++\epsilon},
+\qquad \beta=0.15.
+\label{eq:metric_depth_loss}
+\end{equation}
+This term directly anchors the metric scale of the first-view point map; the
+second-view point map is instead constrained by teacher consistency and the
+event-edge objective.
+
+The local gradient term compares predicted and measured log-depth gradients.
+Let
+\begin{equation}
+E(\mathbf{p})
+=\omega_I\|\nabla I_1^{\ell}(\mathbf{p})\|_1
++\omega_E\|\nabla A_1(\mathbf{p})\|_1,
+\qquad
+A_v=\sum_c|\mathbf{V}_{v,c}|,
+\end{equation}
+and let $W=1+[\operatorname{ZNorm}(E)]_+$.  We use a validity-masked,
+edge-weighted $L_1$ difference along horizontal and vertical directions,
+\begin{equation}
+\mathcal{L}_{\mathrm{grad}}
+=\frac{1}{2}
+\sum_{q\in\{x,y\}}
+\operatorname{WMean}_{\mathcal{P}^{D}_{q}}
+\left(
+\left|
+\nabla_q\log\hat D_1-
+\nabla_q\log D_1^{\mathrm{gt}}
+\right|;W_q
+\right).
+\label{eq:depth_gradient_loss}
+\end{equation}
+
+\vspace{+5pt}
+\noindent\textbf{Event--geometry edge consistency.}
+For both output point maps, let $\hat Z_v$ denote their $z$-coordinate map in
+the common first-view frame.  The event-edge term correlates event activity
+with the magnitude of the corresponding geometry gradient,
+\begin{equation}
+\mathcal{L}_{\mathrm{edge}}
+=\frac{1}{2}\sum_{v=1}^{2}
+\left[
+1-\operatorname{corr}\!\left(
+A_v,\|\nabla\hat Z_v\|_1
+\right)
+\right].
+\label{eq:event_edge_loss}
+\end{equation}
+Both maps are z-normalized over finite pixels before evaluating the
+correlation.  This is weak structural guidance; it does not assume that every
+event is a depth discontinuity.
+
+\vspace{+5pt}
+\noindent\textbf{Event-photometric consistency.}
+When camera intrinsics and a relative pose are available, the first-view
+predicted depth warps the second log-grayscale image to the first view.  Define
+\begin{align}
+\Delta L^{I}
+&=\mathcal{W}(\log \bar I_2^{\ell};\hat D_1,K,T_{1\rightarrow2})
+-\log \bar I_1^{\ell}, \\
+\Delta L^{E}
+&=\sum_{b=0}^{B-1}\mathbf{V}^{+}_{1,b}
+-\sum_{b=0}^{B-1}\mathbf{V}^{-}_{1,b},
+\end{align}
+where $\bar I$ is the channel-mean intensity.  On valid warped pixels, both
+changes are standardized and compared by cosine similarity,
+\begin{equation}
+\mathcal{L}_{\mathrm{photo}}
+=1-\operatorname{cos}\!\left(
+\operatorname{ZNorm}(\Delta L^{I}),
+\operatorname{ZNorm}(\Delta L^{E})
+\right).
+\label{eq:event_photometric_loss}
+\end{equation}
+This comparison is invariant to affine scale in the two change maps and is
+therefore used as a weak consistency signal rather than a calibrated
+pixel-wise brightness reconstruction objective.
+
+\vspace{+5pt}
+\noindent\textbf{Gate regularization.}
+Let $\bar g(u)$ be the scheduled cap on the mean gate and let
+$\mathcal{P}_{\mathrm{low}}=\{i:o_i<o_{\mathrm{thr}}\}$.  The reported model
+uses
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{\mathrm{gate}}
+={}&\mu_{\mathrm{mean}}
+\left[\operatorname{mean}_i g_i-\bar g(u)\right]_{+}^{2}\\
+&+\mu_{\mathrm{low}}
+\operatorname{mean}_{i\in\mathcal{P}_{\mathrm{low}}}g_i^2
++\mu_{\mathrm{logit}}
+\operatorname{mean}_i
+\left[|\ell_i|-\ell_{\mathrm{reg}}\right]_{+}^{2}.
+\end{aligned}
+\label{eq:gate_regularization}
+\end{equation}
+The terms discourage a globally open gate, suppress residuals in weak-event
+regions, and prevent raw gate logits from saturating.  Channel modulation and
+RGB-visibility gating are disabled in the reported BRG configuration.
+
+\vspace{+5pt}
+\noindent\textbf{Optimization and inference.}
+The RGB image encoder, MASt3R cross-view decoder, prediction heads, and teacher
+are frozen.  We optimize the copied event encoder, event residual projection,
+gate network, global event scale, learned statistic affine, and source gate
+biases.  Gradients pass through the frozen cross-view decoder to the event
+adapter.  At inference time, only the low-light RGB pair, event voxels, RGB
+branch, event encoder, BRG, and original decoder/heads are retained.

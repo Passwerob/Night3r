@@ -1,0 +1,9 @@
+_base_: train_night3r_brg_dl3dv_recover_from_stage2.yaml
+lowlight_aug:
+  enabled: true
+  min_exposure: 0.50
+  max_exposure: 0.50
+  read_noise_std: 0.01
+  shot_noise: true
+  gamma_space_input: true
+

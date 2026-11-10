@@ -1,0 +1,96 @@
+_base_: train_night3r_mvsec_only_adapt_1k_from_best.yaml
+
+dataset:
+  root:
+    - "/data/fcr/data/train_data/MVSEC"
+    - "/data/fcr/data/train_data/DSEC"
+    - "/data/fcr/data/train_data/DL3DV"
+  image_size: [128, 128]
+  pair_sampling: "random"
+  min_pair_distance: 1
+  max_pair_distance: 4
+  allow_reverse_pairs: true
+  num_workers: 2
+
+lowlight_aug:
+  enabled: true
+  apply_sources: ["dsec", "dl3dv"]
+  min_exposure: 0.10
+  max_exposure: 0.10
+  read_noise_std: 0.01
+  shot_noise: true
+  gamma_space_input: true
+
+brg:
+  use_gate_regularization: false
+
+loss:
+  dark3r_original: 0.0
+  descriptor_distill: 0.0
+  feat_distill: 0.0
+  structure_consistency: 0.5
+  structure_conf_thr: 1.0
+  structure_min_scale: 1.0
+  structure_max_scale: 1000.0
+  structure_max_point_norm: 10000.0
+  structure_max_residual: 50.0
+  structure_min_valid_fraction: 0.01
+  event_depth_edge: 0.0
+  event_photo: 0.0
+  depth_gt: 2.0
+  depth_gt_source_weights:
+    mvsec: 1.0
+    dsec: 1.0
+    dl3dv: 0.0
+    default: 0.0
+  depth_gradient_gt: 0.0
+  pose_gt: 0.0
+  pose_cycle: 0.0
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 20.0
+
+training:
+  stage: 0
+  num_epochs: 4
+  batch_size: 1
+  symmetric_pairs: true
+  balanced_dataset_sampling: true
+  pose_head_only: false
+  descriptor_head_only: false
+  geometry_head_only: true
+  restore_pristine_geometry_heads: true
+  checkpoint_mode: "geometry_head_only"
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: false
+  grad_clip_norm: 1.0
+  save_every_steps: 200
+  save_every_epoch: false
+  save_every_epoch_fraction: 1.0
+  warmup_steps: 100
+  warmup_start_factor: 0.1
+  lr_event_encoder: 0.0
+  lr_fusion_adapter: 0.0
+  lr_dark3r: 0.0
+  lr_head: 1.0e-5
+  lr_pose_head: 0.0
+  stages:
+    - name: "geometry_head_recovery"
+      stage: 0
+      num_epochs: 4
+      partial_finetune_blocks: 0
+      warmup_steps: 100
+      warmup_start_factor: 0.1
+      lr_event_encoder: 0.0
+      lr_fusion_adapter: 0.0
+      lr_dark3r: 0.0
+      lr_head: 1.0e-5
+      lr_pose_head: 0.0
+
+eval:
+  every_epochs: 0
+  batch_size: 1
+  num_workers: 0
+  max_batches: 0

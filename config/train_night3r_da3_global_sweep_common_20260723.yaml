@@ -1,0 +1,33 @@
+_base_: train_night3r_da3_partial_rgb_emphasis_600_20260723.yaml
+
+# Continue from the three-dataset checkpoint and adapt the complete RGB and
+# cross-view trunk. Sweep checkpoints contain model weights only.
+training:
+  stage: 5
+  num_epochs: 4
+  partial_finetune_blocks: 24
+  save_every_steps: 100
+  save_optimizer_state: false
+  warmup_steps: 50
+  warmup_start_factor: 0.05
+  lr_event_encoder: 2.5e-7
+  lr_fusion_adapter: 5.0e-7
+  lr_dark3r: 5.0e-8
+  lr_head: 0.0
+  source_sampling_weights:
+    dl3dv: 3
+    dsec: 2
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "da3_global_sweep"
+      stage: 5
+      num_epochs: 4
+      partial_finetune_blocks: 24
+      warmup_steps: 50
+      warmup_start_factor: 0.05
+      lr_event_encoder: 2.5e-7
+      lr_fusion_adapter: 5.0e-7
+      lr_dark3r: 5.0e-8
+      lr_head: 0.0
+

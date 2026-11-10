@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+outputs/
+logs/
+wandb/
+runs/
+downloads/
+checkpoints/
+test/
+
+# Paper weights are released on Hugging Face.
+KEEP_PAPER_WEIGHTS_DO_NOT_DELETE/*.pth
+
+*.tmp
+*.swp
+.DS_Store
+__MACOSX/

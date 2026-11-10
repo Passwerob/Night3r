@@ -1,0 +1,10 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Isolate source-specific statistic normalization while retaining source bias.
+fusion:
+  use_source_bias: true
+
+brg:
+  use_source_bias: true
+  use_source_stat_norm: false
+

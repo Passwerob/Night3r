@@ -1,0 +1,31 @@
+_base_: train_night3r_da3_joint_mvsec_dsec_dl3dv_ft1k_20260722.yaml
+
+# DA3 is the primary DL3DV depth teacher. Real-depth replay from DSEC and
+# MVSEC limits cross-domain drift while DL3DV receives four times as many
+# samples as either replay source.
+loss:
+  pseudo_depth_metric_scale_weight: 0.0
+
+training:
+  num_epochs: 4
+  save_every_steps: 100
+  warmup_steps: 50
+  warmup_start_factor: 0.05
+  lr_event_encoder: 1.0e-6
+  lr_fusion_adapter: 2.0e-6
+  source_sampling_weights:
+    dl3dv: 4
+    dsec: 1
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "da3_depth_repair_shape_800_stage0"
+      stage: 0
+      num_epochs: 4
+      partial_finetune_blocks: 0
+      warmup_steps: 50
+      warmup_start_factor: 0.05
+      lr_event_encoder: 1.0e-6
+      lr_fusion_adapter: 2.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0

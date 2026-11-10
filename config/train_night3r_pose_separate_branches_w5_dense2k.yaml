@@ -1,0 +1,9 @@
+_base_: train_night3r_pose_rotation_w5_dense2k.yaml
+
+pose_head:
+  enabled: true
+  hidden_dim: 512
+  pool_hidden_dim: 128
+  dropout: 0.1
+  separate_branches: true
+

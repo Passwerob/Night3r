@@ -1,0 +1,8 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Inverse-gamma to the approximate linear domain, then use read noise only.
+lowlight_aug:
+  gamma_space_input: true
+  read_noise_std: 0.01
+  shot_noise: false
+

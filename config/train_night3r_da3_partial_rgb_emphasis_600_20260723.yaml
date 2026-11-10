@@ -1,0 +1,20 @@
+_base_: train_night3r_da3_partial_rgb_balanced_600_20260723.yaml
+
+# DL3DV and DSEC receive equal emphasis; MVSEC remains a replay anchor.
+training:
+  source_sampling_weights:
+    dl3dv: 2
+    dsec: 2
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "da3_partial_rgb_emphasis_600_stage4"
+      stage: 4
+      num_epochs: 4
+      partial_finetune_blocks: 2
+      warmup_steps: 50
+      warmup_start_factor: 0.05
+      lr_event_encoder: 5.0e-7
+      lr_fusion_adapter: 1.0e-6
+      lr_dark3r: 1.0e-7
+      lr_head: 0.0

@@ -1,0 +1,205 @@
+\subsection{Event-Input Controls}
+
+We evaluate the final reported checkpoint,
+\path{outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth},
+under real, zero, and shuffled event inputs.  All settings use the same model
+weights and the same 128 fixed adjacent frame pairs.  The zero control removes
+the event signal entirely.  The shuffle control preserves the event-value
+distribution and event reliability statistics while breaking spatial and
+temporal alignment with RGB.
+
+\begin{table}[h]
+\centering
+\caption{Final Night3R checkpoint under real, zero, and shuffled event inputs.
+All results use the MVSEC-only 1k final weight.  Lower AbsRel and higher
+$\delta_1$ are better.}
+\label{tab:event-control}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Event & Raw AbsRel \down & Raw $\delta_1$ \up & Median AbsRel \down & Median $\delta_1$ \up \\
+\midrule
+\multirow{3}{*}{DSEC} & Real & \best{0.1356} & \best{0.8373} & \best{0.0559} & \best{0.9826} \\
+ & Zero & 0.3101 & 0.2689 & 0.1071 & 0.9176 \\
+ & Shuffle & 0.1833 & 0.6305 & 0.0866 & 0.9188 \\
+\midrule
+\multirow{3}{*}{MVSEC} & Real & \best{0.2073} & \best{0.8118} & \best{0.1949} & \best{0.8016} \\
+ & Zero & 0.6798 & 0.2057 & 0.4216 & 0.3514 \\
+ & Shuffle & 0.3165 & 0.5754 & 0.3122 & 0.5027 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Real events consistently outperform both controls.  On MVSEC, real events
+reduce Raw AbsRel by 69.5\% relative to zero events and by 34.5\% relative to
+shuffled events.  On DSEC, the corresponding reductions are 56.3\% and 26.0\%.
+Both datasets therefore exhibit the ordering Real $<$ Shuffle $<$ Zero in Raw
+AbsRel.  This shows that the final model benefits from the presence of event
+measurements, while the additional degradation caused by shuffling confirms
+that correct event--RGB alignment is essential.
+
+Importantly, real and shuffled inputs have nearly identical event density,
+occupancy, and mean gate values.  For MVSEC, the mean gates are 0.0203 and
+0.0205 for real and shuffled events, respectively; for DSEC, both are 0.0211.
+The accuracy gap therefore cannot be explained by event count, marginal event
+statistics, or a larger average fusion gate.  It is caused by whether the
+event residual carries correctly aligned local structure.
+
+MVSEC Raw AbsRel (0.2073) and median-aligned AbsRel (0.1949) are close, showing
+that the final checkpoint retains stable metric-scale calibration on its target
+domain.  On DSEC, Raw AbsRel is 0.1356 while median-aligned AbsRel is 0.0559,
+indicating accurate relative geometry but a remaining cross-domain scale
+offset.  MVSEC warp PSNR changes by less than 0.1 dB across the three event
+modes, so depth accuracy is a substantially more sensitive event-input metric
+than this pairwise photometric diagnostic.
+
+\paragraph{Controlled synthetic low-light depth evaluation.}
+To evaluate low-light robustness independently of stored image brightness, we
+darken the same 128 fixed DSEC pairs at test time.  Each sRGB image is
+inverse-gamma linearized with $\gamma=2.2$, multiplied by a fixed exposure,
+corrupted by signal-dependent shot noise and signal-independent read noise with
+scale 0.01, clipped, and gamma encoded.  Noise is keyed by sample identifier,
+so MASt3R, Dark3R, and all three Night3R controls receive pixelwise identical
+darkened RGB.  The recorded event voxel is retained, zeroed, or shuffled
+according to the event control.
+
+\begin{table*}[t]
+\centering
+\caption{DSEC depth accuracy for the final MVSEC-only 1k checkpoint under
+controlled synthetic low light.  All settings use identical darkened RGB.}
+\label{tab:event-control-dsec-darken}
+\begin{tabular}{clrrrr}
+\toprule
+Exposure & Input/model & Raw AbsRel $\downarrow$ & Raw $\delta_1$ $\uparrow$ & Median AbsRel $\downarrow$ & Median $\delta_1$ $\uparrow$ \\
+\midrule
+\multirow{5}{*}{0.20} & MASt3R & 0.3907 & 0.0602 & 0.1623 & 0.7494 \\
+ & Dark3R & 0.5885 & 0.0002 & 0.1632 & 0.7585 \\
+ & Real & 0.1611 & 0.7128 & \best{0.0710} & \best{0.9679} \\
+ & Zero & \best{0.1182} & \best{0.8420} & 0.1096 & 0.8882 \\
+ & Shuffle & 0.1868 & 0.6256 & 0.1410 & 0.7920 \\
+\midrule
+\multirow{5}{*}{0.10} & MASt3R & 0.5450 & 0.0082 & 0.2610 & 0.5263 \\
+ & Dark3R & 0.6573 & 0.0000 & 0.1998 & 0.6591 \\
+ & Real & 0.1727 & 0.6503 & \best{0.0796} & \best{0.9565} \\
+ & Zero & \best{0.1393} & \best{0.7839} & 0.1325 & 0.8226 \\
+ & Shuffle & 0.2105 & 0.5525 & 0.1684 & 0.7308 \\
+\midrule
+\multirow{5}{*}{0.05} & MASt3R & 0.8724 & 0.0008 & 0.4914 & 0.3486 \\
+ & Dark3R & 0.8102 & 0.0000 & 0.2839 & 0.5164 \\
+ & Real & \best{0.1859} & \best{0.5861} & \best{0.0934} & \best{0.9301} \\
+ & Zero & 0.3479 & 0.2341 & 0.1939 & 0.7317 \\
+ & Shuffle & 0.2555 & 0.4132 & 0.2028 & 0.6611 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+At $e=0.05$, real events reduce Raw AbsRel by 78.7\% relative to MASt3R,
+77.1\% relative to Dark3R, 46.6\% relative to zero, and 27.2\% relative to
+shuffle.  They reduce Median AbsRel by 67.1\% relative to Dark3R, 51.8\%
+relative to zero, and 53.9\% relative to shuffle.  At $e=0.20$
+and $e=0.10$, real events remain best after median alignment, while zero events
+have lower raw-scale error.  This indicates a scale-calibration offset rather
+than better relative geometry for the zero control.  The monotonic MASt3R
+degradation and real-over-shuffle advantage show that aligned events become
+increasingly important as RGB visibility decreases.
+
+\paragraph{DL3DV diagnostics.}
+The same final checkpoint is also evaluated on 128 fixed adjacent pairs from
+the full DL3DV evaluation root.  The local DL3DV format provides neither metric
+depth ground truth nor usable warp supervision for this evaluator; consequently,
+we report event-path diagnostics rather than reconstruction accuracy.
+
+\begin{table}[h]
+\centering
+\caption{Event-path diagnostics on DL3DV.  These values verify event-control
+execution and distribution preservation; they are not reconstruction accuracy
+metrics.}
+\label{tab:event-control-dl3dv}
+\begin{tabular}{lrrr}
+\toprule
+Event & Gate mean & Event density & Event occupancy \\
+\midrule
+Real & 0.01918 & 0.5803 & 0.6115 \\
+Zero & 0.00000 & 0.0000 & 0.0000 \\
+Shuffle & 0.01916 & 0.5803 & 0.6115 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Real and shuffled DL3DV events retain the same density and occupancy and induce
+almost identical mean gates, whereas the zero input fully disables the event
+path.  This equality is expected because the shuffle control uses circular
+spatial and event-bin shifts: it preserves every event value and therefore
+preserves all marginal count statistics exactly.  The local split has no metric
+depth or usable warp-quality reference, so these diagnostics cannot by
+themselves establish a depth improvement.  Its camera trajectories do, however,
+permit the separate pose evaluation below.
+
+\paragraph{Trajectory evaluation.}
+We additionally recover a camera trajectory from the dense model outputs.  For
+each adjacent pair, inference is run in both image orders.  The point map of the
+same image expressed in camera~1 and camera~2 coordinates is registered with a
+trimmed Umeyama Sim(3) fit.  Both MASt3R head directions are evaluated and the
+direction with the lower normalized 3D registration residual is retained.  The
+relative rotation is used directly, while relative translation is normalized
+per edge because monocular pairwise reconstruction has an arbitrary scale.
+Relative poses are chained for 32 frames, followed by one EVO Sim(3) alignment
+per scene.  We report the mean of per-scene RMSE over six scenes.  DL3DV camera
+axes are converted from OpenGL to OpenCV before evaluation.  DSEC is unavailable
+because the local DSEC test export contains no camera-pose ground truth.
+This table uses no test-time low-light augmentation: MVSEC is the real
+\texttt{outdoor\_night2} sequence, while DL3DV records
+\texttt{image\_mode=copy} and therefore uses source RGB without synthetic
+darkening.
+
+\begin{table*}[t]
+\centering
+\caption{Trajectory accuracy for the final MVSEC-only 1k checkpoint.  ATE and
+RPE are computed over six 32-frame trajectories after one per-scene Sim(3)
+alignment.  Lower is better.}
+\label{tab:event-control-pose}
+\begin{tabular}{llrrr}
+\toprule
+Dataset & Input/model & ATE (m) $\downarrow$ & RPE trans. (m) $\downarrow$ & RPE rot. ($^\circ$) $\downarrow$ \\
+\midrule
+\multirow{4}{*}{MVSEC} & MASt3R & \textbf{0.3705} & \textbf{0.2557} & \textbf{6.44} \\
+ & Real & 0.3822 & 0.2829 & 95.77 \\
+ & Zero & 0.4707 & 0.3613 & 133.19 \\
+ & Shuffle & 0.4992 & 0.3086 & 111.56 \\
+\midrule
+\multirow{4}{*}{DL3DV} & MASt3R & \textbf{0.2570} & \textbf{0.1426} & \textbf{1.60} \\
+ & Real & 0.4289 & 0.3151 & 153.71 \\
+ & Zero & 0.4984 & 0.3290 & 155.16 \\
+ & Shuffle & 0.3053 & 0.2516 & 139.71 \\
+\midrule
+DSEC & \multicolumn{4}{l}{Not available: no camera-pose ground truth in the local test export.} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+On MVSEC, real events reduce ATE by 18.8\% relative to zero events and by
+23.4\% relative to shuffled events.  They also reduce translational RPE by
+21.7\% and 8.4\%, respectively.  Thus the pose translation metrics agree with
+the depth controls on the target domain: aligned event measurements are more
+useful than either removing the event signal or preserving its distribution
+while breaking alignment.
+
+This conclusion does not transfer cleanly to DL3DV.  Real events improve ATE
+over zero events (0.4289 versus 0.4984), but shuffled events obtain the lower
+ATE of 0.3053.  More importantly, all three Night3R inputs have very large
+rotation RPE and normalized bidirectional point-map residuals above 1.0,
+whereas MASt3R obtains 1.60 degrees and a residual of 0.0199 on DL3DV.  The
+corresponding MVSEC residuals are 1.2295 for real events and 0.1104 for MASt3R.
+Consequently, these trajectory results support a real-event advantage over the
+zero/shuffle controls only on MVSEC; they do not support a claim that the final
+depth-adapted checkpoint improves pose over MASt3R.  They instead reveal that
+the current fine-tuning preserves useful depth ordering while degrading full
+XYZ cross-view consistency and rotation recovery.
+
+For completeness, we repeated the DL3DV trajectory protocol after deterministic
+darkening at exposures 0.20/0.10/0.05.  MASt3R obtains ATE
+0.2495/0.2368/0.2489 and rotation RPE 1.76/2.19/3.11 degrees.  Night3R with real
+events obtains ATE 0.4502/0.4533/0.4124 and rotation RPE
+156.12/156.54/156.79 degrees; zero and shuffled events remain similarly poor
+and show no consistent ordering.  Explicit darkening therefore does not repair
+the final checkpoint's cross-view XYZ inconsistency.  This negative result is
+retained as a diagnostic and is not used to claim low-light pose improvement.

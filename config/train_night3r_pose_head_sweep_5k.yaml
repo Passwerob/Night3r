@@ -1,0 +1,101 @@
+_base_: train_night3r_pose_head_mvsec_dl3dv_3k.yaml
+
+# The RGB/event geometry pathway is frozen, so the pose head should see the
+# same final-cap representation at every checkpoint in the learning curve.
+brg:
+  gate_cap_start: 0.45
+  gate_cap_final: 0.45
+  gate_cap_warmup_steps: 0
+  gate_mean_cap_start: 0.14
+  gate_mean_cap_final: 0.14
+  gate_mean_cap_warmup_steps: 0
+
+dataset:
+  # Paper-test scenes plus validation clips/guards are excluded from training.
+  exclude_scenes:
+    - "screen-000020-mvsec"
+    - "screen-000050-mvsec"
+    - "screen-000095-mvsec"
+    - "screen-000110-mvsec"
+    - "screen-000115-mvsec"
+    - "screen-000122-mvsec"
+    - "screen-000123-mvsec"
+    - "screen-000129-mvsec"
+    - "screen-000144-mvsec"
+    - "screen-000156-mvsec"
+    - "screen-000157-mvsec"
+    - "screen-000170-mvsec"
+    - "screen-000200-mvsec"
+    - "screen-000205-mvsec"
+    - "screen-000207-mvsec"
+    - "screen-000208-mvsec"
+    - "screen-000220-mvsec"
+    - "screen-000226-mvsec"
+
+    # MVSEC validation clips and immediate temporal neighbors.
+    - "screen-000033-mvsec"
+    - "screen-000034-mvsec"
+    - "screen-000035-mvsec"
+    - "screen-000081-mvsec"
+    - "screen-000082-mvsec"
+    - "screen-000083-mvsec"
+    - "screen-000179-mvsec"
+    - "screen-000180-mvsec"
+    - "screen-000181-mvsec"
+
+    # DL3DV paper-test source scene 0024. Test clips 0004--0007 live in the
+    # eval root, while these sibling clips would otherwise leak that source.
+    - "screen-000080"
+    - "screen-000081"
+    - "screen-000082"
+
+    # Complete DL3DV source scenes 0006, 0043, and 0064. One clip from each
+    # source is used for validation; all sibling clips remain excluded.
+    - "screen-000007"
+    - "screen-000008"
+    - "screen-000009"
+    - "screen-000010"
+    - "screen-000011"
+    - "screen-000012"
+    - "screen-000013"
+    - "screen-000014"
+    - "screen-000136"
+    - "screen-000137"
+    - "screen-000138"
+    - "screen-000139"
+    - "screen-000140"
+    - "screen-000141"
+    - "screen-000142"
+    - "screen-000173"
+    - "screen-000174"
+    - "screen-000175"
+    - "screen-000176"
+    - "screen-000177"
+    - "screen-000178"
+    - "screen-000179"
+    - "screen-000180"
+
+training:
+  pose_head_only: true
+  checkpoint_mode: "pose_head_only"
+  save_every_steps: 200
+  save_every_epoch: false
+  num_epochs: 3
+  warmup_steps: 200
+  warmup_start_factor: 0.05
+  lr_pose_head: 3.0e-4
+  stages:
+    - name: "pose_head_sweep"
+      stage: 0
+      num_epochs: 3
+      partial_finetune_blocks: 0
+      warmup_steps: 200
+      warmup_start_factor: 0.05
+      lr_event_encoder: 0.0
+      lr_fusion_adapter: 0.0
+      lr_dark3r: 0.0
+      lr_head: 0.0
+      lr_pose_head: 3.0e-4
+
+eval:
+  every_epochs: 0

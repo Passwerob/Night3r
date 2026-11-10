@@ -1,0 +1,18 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Keep the copied deep event encoder frozen. Only the event patch embedding and
+# BRG fusion adapter are optimized, matching training stage 1 semantics.
+training:
+  stage: 1
+  stages:
+    - name: "event_patch_and_fusion_only"
+      stage: 1
+      num_epochs: 2
+      partial_finetune_blocks: 0
+      warmup_steps: 400
+      warmup_start_factor: 0.05
+      lr_event_encoder: 5.0e-6
+      lr_fusion_adapter: 7.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0
+

@@ -1,0 +1,236 @@
+Night3R pose-evaluation audit (2026-07-16)
+============================================================
+
+Scope
+-----
+
+This audit covers the trajectory results produced from the final checkpoint:
+
+    outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+It does not change the direct depth metrics (AbsRel, delta_1, RMSE, and related
+statistics), because those metrics compare the predicted depth map with depth
+GT and do not use point-map registration or trajectory chaining.
+
+
+1. Confirmed evaluation errors
+------------------------------
+
+1.1 Failed point-map registrations were accepted as valid poses
+
+The evaluator registers the same predicted image point map expressed in two
+camera coordinate systems using a trimmed Umeyama Sim(3) fit. The old code
+returned success whenever enough points survived trimming. It did not reject a
+fit with a very large normalized 3D RMSE. Consequently, Night3R registrations
+with residuals around 1.0--1.3 were chained into trajectories and reported as
+ATE/RPE, even though a single rigid transform did not explain the two point
+maps. The resulting 95--156 degree rotation numbers were not valid pose
+measurements.
+
+Correction:
+
+    --max-pointmap-residual 0.25
+
+The residual is the trimmed 3D RMSE divided by the median spatial extent of the
+target point map. A registration above 0.25 is now rejected with:
+
+    reason = pointmap_residual_above_threshold
+
+Rejected edges are excluded from trajectory chaining and cannot produce
+ATE/RPE. The threshold retains the verified MASt3R pairs (roughly 0.02--0.20 in
+the pair audit) and rejects the current Night3R pairs (roughly 0.9--1.7 over the
+full evaluation).
+
+1.2 Position alignment contaminated the absolute rotation metric
+
+The old trajectory code applied one position-based Umeyama Sim(3) alignment to
+the complete camera poses and then computed both translation and rotation
+metrics from those transformed poses. On a short, nearly collinear camera path,
+the position alignment is underconstrained around the motion axis. This can
+produce a large arbitrary alignment roll even when adjacent relative rotations
+are accurate. For example, the DL3DV MASt3R 8-frame smoke test had a mean pair
+rotation error of 0.60 degrees and rotation RPE of 0.73 degrees, but the old APE
+rotation was 151.64 degrees.
+
+Correction:
+
+    translation metrics: per-scene Sim(3) position/scale alignment
+    rotation metrics: first-pose origin alignment
+
+After the correction, the same smoke test has APE rotation 2.06 degrees and RPE
+rotation 0.73 degrees. This keeps the monocular scale correction needed by ATE
+without injecting a position-alignment degeneracy into camera orientation.
+
+1.3 Failed bidirectional diagnostics selected the first direction
+
+When both bidirectional registrations failed, the evaluator stored diagnostics
+from the first direction rather than the lower-residual direction. This did not
+affect ATE/RPE, because both transforms were already invalid, but it made the
+failure residual less informative. The evaluator now selects the lower-residual
+diagnostic direction even when both directions are rejected and aggregates a
+registration residual over all attempted edges.
+
+
+2. Coordinate and direction audit
+---------------------------------
+
+The relative-pose direction itself is correct.
+
+For the forward pair (image 1, image 2), Night3R/MASt3R predicts:
+
+    pred1[pts3d]                         image-1 points in camera-1 coordinates
+    pred2[pts3d_in_other_view]           image-2 points in camera-1 coordinates
+
+For the reversed pair (image 2, image 1), it predicts:
+
+    reverse_pred1[pts3d]                 image-2 points in camera-2 coordinates
+    reverse_pred2[pts3d_in_other_view]   image-1 points in camera-2 coordinates
+
+The evaluator therefore registers either image-2 point maps or image-1 point
+maps to recover T_camera2_from_camera1. The dataset relative pose uses the same
+direction:
+
+    T_camera2_from_camera1 = inverse(T_world_from_camera2)
+                             * T_world_from_camera1
+
+DL3DV camera axes are converted from OpenGL to OpenCV with diag(1,-1,-1) on
+both sides of the relative transform. Correct MASt3R pair rotations on both
+MVSEC and DL3DV confirm that pair order, transform direction, and the DL3DV axis
+conversion are not the source of the large old errors.
+
+
+3. Pair-level checkpoint audit
+------------------------------
+
+Audit outputs:
+
+    outputs/pose_audit_20260716/dl3dv_pair0.json
+    outputs/pose_audit_20260716/mvsec_pair0.json
+
+DL3DV pair screen-000083:000000-000001:
+
+    MASt3R direction 1: residual 0.0588, rotation error 0.43 degrees
+    MASt3R direction 2: residual 0.0615, rotation error 0.40 degrees
+    checkpoint RGB path: residual 1.214/1.042, rotation error 173.5/178.3 degrees
+    Night3R real event: residual 1.312/1.011, rotation error 173.1/164.7 degrees
+
+MVSEC pair screen-000123-mvsec:000000-000001:
+
+    MASt3R direction 1: residual 0.140, rotation error 1.30 degrees
+    MASt3R direction 2: residual 0.204, rotation error 2.74 degrees
+    checkpoint RGB path: residual 1.277/1.108, rotation error 105.3/161.9 degrees
+    Night3R real event: residual 1.350/1.251, rotation error 83.3/74.6 degrees
+
+The zero-event Night3R output is numerically identical to the final
+checkpoint's internal RGB path for both audited views (mean and maximum
+absolute difference are zero). The problem is therefore not caused by zero
+event construction, pair swapping, or event ordering. The inherited checkpoint
+already has inconsistent cross-view XYZ predictions before event injection.
+
+
+4. Corrected full stored-RGB results
+------------------------------------
+
+Protocol: six scenes, 32 frames per scene, 31 adjacent edges per scene, 186
+attempted edges per dataset/method, residual threshold 0.25. ATE/RPE are only
+reported when valid contiguous trajectories exist.
+
+Dataset  Input/model  Valid edges  Recovery  All-edge residual  ATE(m)  RPE-t(m)  RPE-r(deg)
+MVSEC   MASt3R        167/186      89.8%     0.1104             0.2488  0.2324    4.25
+MVSEC   Real            0/186       0.0%     1.2295             --      --        --
+MVSEC   Zero            0/186       0.0%     1.0065             --      --        --
+MVSEC   Shuffle         0/186       0.0%     1.1338             --      --        --
+DL3DV   MASt3R        186/186     100.0%     0.0199             0.2570  0.1426    1.60
+DL3DV   Real            0/186       0.0%     1.1992             --      --        --
+DL3DV   Zero            0/186       0.0%     1.1725             --      --        --
+DL3DV   Shuffle         0/186       0.0%     1.2099             --      --        --
+
+Corrected JSON files use the tag:
+
+    corrected_v2_6scene32
+
+under:
+
+    outputs/final_mvsec1k_pose_controls_20260715/
+
+
+5. Correct interpretation
+-------------------------
+
+The previous Night3R ATE/RPE values must be withdrawn. They do not show that
+Night3R has a 95--156 degree pose error; they show that the point-map
+registration failed and the evaluator failed to reject it. The valid conclusion
+is narrower:
+
+    The final depth-selected Night3R checkpoint cannot currently provide a
+    valid rigid camera trajectory under this bidirectional point-map protocol.
+
+No Real-versus-Zero-versus-Shuffle pose claim can be made, because all three
+Night3R variants have zero valid edges. Direct depth results remain valid and
+can still support the aligned-event ablation on DSEC/MVSEC.
+
+
+6. Why the final checkpoint has this failure
+---------------------------------------------
+
+The final MVSEC-only 1k stage freezes the MASt3R backbone/head, but initializes
+from:
+
+    outputs/night3r_oldtest_recovery_from_best_currenttest_train_4gpu_3k/
+        last_event_dark3r.pth
+
+That 3k stage in turn initializes from the earlier stage-3 checkpoint:
+
+    outputs/night3r_brg_token_reg_bf16_4gpu_001/
+        event_dark3r_epoch0007_stage3_stageepoch0002_step00036386.pth
+
+The earlier run used nonzero decoder/head learning rates during stage 2/3. Its
+training configuration also used:
+
+    symmetric_pairs = false
+    pose_gt = 0.0
+
+In train_event_dark3r.py, the strong supervised depth and pose branches call:
+
+    supervised_depth_gt_loss(student_out[0], ...)
+    pose_gt_loss(student_out[0], ...)
+
+Thus the first-view depth receives strong supervision, while the second-view
+cross-view point map is not given the same GT constraint. Feature distillation
+and structure consistency touch both outputs, but their weights are much lower
+than the first-view depth term. This training recipe can improve direct depth
+while allowing the cross-view XYZ/rotation branch to drift. The final 3k and 1k
+adapter-only stages inherit that drift; they do not create or repair it.
+
+
+7. Required changes before claiming pose performance
+-----------------------------------------------------
+
+1. Train with symmetric pair order or apply equivalent losses to both outputs.
+2. Supervise both same-view depth and cross-view point maps, not only
+   student_out[0].
+3. Keep the pretrained MASt3R decoder/head frozen until a bidirectional rigid
+   consistency loss is active and validated.
+4. Add a per-batch bidirectional registration/cycle diagnostic during training.
+5. Select pose checkpoints using valid-edge recovery and residual in addition
+   to depth AbsRel.
+6. Report trajectory coverage together with ATE/RPE; never report ATE/RPE for a
+   method whose registrations fail the validity test.
+
+
+8. Verification
+---------------
+
+The pose evaluator test suite contains seven passing tests, including known
+PnP recovery, essential-matrix recovery, robust Sim(3) recovery with outliers,
+non-rigid point-map rejection, failed-direction diagnostic selection, and the
+near-collinear position-alignment rotation case.
+
+Command:
+
+    /data/fcr/miniconda3/envs/stream3r/bin/python -m pytest -q \
+        tests/test_pose_trajectory_eval.py
+
+Result:
+
+    7 passed

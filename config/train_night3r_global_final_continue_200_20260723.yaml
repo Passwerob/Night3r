@@ -1,0 +1,27 @@
+_base_: train_night3r_da3_global_full_shape_600_20260723.yaml
+
+# Conservative continuation from the selected three-dataset trade-off model.
+# Keep the same datasets, shape-only DA3 pseudo-depth objective, source replay
+# ratio, and trainable parameter groups that produced the global-full endpoint.
+training:
+  num_epochs: 2
+  save_every_steps: 100
+  save_optimizer_state: false
+  warmup_steps: 20
+  warmup_start_factor: 0.1
+  source_sampling_weights:
+    dl3dv: 4
+    dsec: 2
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "global_final_continue_200_stage6"
+      stage: 6
+      num_epochs: 2
+      partial_finetune_blocks: 24
+      warmup_steps: 20
+      warmup_start_factor: 0.1
+      lr_event_encoder: 2.5e-7
+      lr_fusion_adapter: 5.0e-7
+      lr_dark3r: 5.0e-8
+      lr_head: 5.0e-9

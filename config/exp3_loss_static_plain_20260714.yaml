@@ -1,0 +1,7 @@
+_base_: exp2_loss_uniform_source_20260714.yaml
+
+# Remove both active-weight normalization and non-unit weights on available
+# supervision. Missing-supervision sources remain disabled by the base config.
+loss:
+  normalize_by_active_weight: false
+

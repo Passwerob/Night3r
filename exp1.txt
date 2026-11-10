@@ -1,0 +1,686 @@
+import pypandoc
+
+content = r"""# Night3R 实验设计与验证方案总结
+
+## 1. 主结果实验（Main Results）
+
+### 实验目标
+证明 Night3R 相比现有 RGB-only、低光增强以及 Event-based 方法，在低光三维重建任务中的有效性。
+
+### 实验设置
+
+| 方法 | 输入 | 训练数据 | 作用 |
+|---|---|---|---|
+| MASt3R | RGB | pretrained | RGB-only baseline |
+| Dark3R LoRA | dark RGB | low-light init | 低光 RGB baseline |
+| VATS300 | RGB/Event | existing | 现有 event baseline |
+| EventDark3R legacy tensor | RGB+Event | MVSEC/DSEC | 传统 event 融合方法 |
+| Night3R-BRG | RGB+Event | MVSEC-only | 当前主要模型 |
+| Night3R-BRG | RGB+Event | MVSEC+DSEC+DL3DV | 最终模型候选 |
+
+### 数据集
+
+- DSEC-current
+- MVSEC-current
+- DSEC test split
+- MVSEC test split
+
+### 对比指标
+
+- AbsRel ↓
+- δ1 ↑
+- RMSE
+- PSNR
+- Median AbsRel
+- Median δ1
+
+目标：证明 event 信息能够提升低光环境下的三维匹配与深度恢复能力。
+
+
+---
+
+# 2. 泛化实验（Generalization）
+
+## 2.1 跨数据集泛化
+
+### 目的
+验证模型是否只是记忆训练数据，而不是依赖特定场景。
+
+### 设置
+
+- MVSEC train → DSEC test
+- DSEC train → MVSEC test
+
+### 对比
+
+- MASt3R
+- MVSEC-only Night3R
+- Mixed Night3R
+
+### 指标
+
+- Depth metrics
+- AbsRel
+- δ1
+
+
+---
+
+# 3. 混合训练实验（Mixed Training）
+
+## 实验目标
+
+验证混合不同来源数据是否能够提升低光场景鲁棒性。
+
+## 设置
+
+训练：
+
+- MVSEC-only
+- DSEC-only
+- MVSEC + DSEC + DL3DV
+
+测试：
+
+- DSEC test
+- MVSEC test
+
+比较不同训练策略对于跨域能力的影响。
+
+
+---
+
+# 4. 消融实验（Ablation Study）
+
+## 4.1 Event Fusion 结构消融
+
+### 目的
+
+证明 BRG(Event-RGB Fusion) 设计的必要性。
+
+比较：
+
+| Variant | Event Stats | Gate |
+|---|---|---|
+| RGB-only MASt3R | none | none |
+| Scalar gate | none | global scalar |
+| Tensor gate | optional | per-token/channel |
+| BRG no stats | no | token |
+| BRG no reg | yes | token |
+| BRG no bound | yes | token |
+| Full Night3R-BRG | yes | token |
+
+指标：
+
+- DSEC AbsRel
+- MVSEC AbsRel
+- Gate Mean
+
+
+---
+
+## 4.2 Event Statistics 消融
+
+### 目的
+
+验证 event density / occupancy / polarity 等统计信息是否有效。
+
+比较：
+
+- 无 event statistics
+- 使用 event statistics
+
+观察：
+
+- 深度误差
+- gate activation
+
+
+---
+
+## 4.3 Gate Regularization 消融
+
+### 目的
+
+验证 gate 正则化是否避免模型过度依赖 event。
+
+比较：
+
+- Full model
+- No gate regularization
+
+分析：
+
+- gate mean
+- gate saturation
+- failure case
+
+
+---
+
+## 4.4 Bounded Residual 消融
+
+### 目的
+
+验证 bounded residual 约束是否能够稳定 RGB-event feature fusion。
+
+比较：
+
+- bounded residual
+- unbounded residual
+- replace RGB token
+
+指标：
+
+- Depth error
+- Feature stability
+
+
+---
+
+# 5. 低光数据合理性验证
+
+## 目标
+
+证明合成低光数据不会产生与真实低光不同的退化模式。
+
+验证：
+
+1. 物理合理性
+
+- raw 域 Gaussian noise
+- gamma mapping
+- Poisson-Gaussian noise model
+
+
+2. 统计合理性
+
+Mean-Variance analysis：
+
+μ = E[I]
+
+σ² = Var(I)
+
+验证：
+
+σ² = aμ+b
+
+
+3. Feature degradation
+
+比较：
+
+||F_clean - F_real_low||
+
+和：
+
+||F_clean - F_syn_low||
+
+分析：
+
+- feature distance
+- matching confidence
+- epipolar error
+
+
+---
+
+# 6. Event 有效性测试（Event Robustness）
+
+## 实验目标
+
+证明 event 提供的是有效动态亮度变化信息，而不是简单增加输入。
+
+## Test Setting
+
+| Setting | RGB | Event | 预期 |
+|---|---|---|---|
+| Normal | real dark RGB | real event | 最优 |
+| Zero event | real dark RGB | all zero | 接近 RGB-only 或下降 |
+| Shuffled event | real dark RGB | batch 内打乱 | 明显下降 |
+| Wrong polarity | real dark RGB | polarity reversed | 下降 |
+| Temporal reversed | real dark RGB | event bins reversed | 下降 |
+| Bright RGB | normal RGB | real event | gate降低 |
+| Extreme dark | dark005/dark010 | real event | event帮助明显 |
+
+指标：
+
+- AbsRel
+- δ1
+- Gate mean
+- Gate activation curve
+
+
+---
+
+# 7. 可视化实验
+
+## 目的
+
+直观展示 event fusion 对三维重建的帮助。
+
+展示：
+
+- RGB image
+- Event visualization
+- Depth prediction
+- Point cloud
+- Gate activation map
+
+
+重点场景：
+
+- 极暗区域
+- 快速运动
+- 高动态范围区域
+
+
+---
+
+# 8. 效率实验
+
+## 目的
+
+证明方法提升不是以巨大计算成本换取。
+
+比较：
+
+- FPS
+- VRAM
+- Parameters
+
+方法：
+
+- MASt3R
+- Night3R
+
+
+---
+
+# 整体实验逻辑
+
+1. Main Result：
+证明 Night3R 有效。
+
+2. Generalization：
+证明模型泛化能力。
+
+3. Ablation：
+证明每个设计模块有效。
+
+4. Data Validation：
+证明低光数据构造合理。
+
+5. Event Robustness：
+证明 event 本身提供有效信息。
+
+6. Visualization：
+解释模型行为。
+
+7. Efficiency：
+证明实际可用性。
+
+
+# 9. 已完成实验记录（2026-07-11）
+
+## 9.1 Current split 主结果与 Event Robustness
+
+状态：已完成。
+
+- MVSEC-current：128 pairs。
+- DSEC-current：128 pairs。
+- 方法：MASt3R、Dark3R LoRA、MVSEC-specialized Night3R、VATS300、
+  Mixed Night3R。
+- Event controls：real、zero、shuffle、polarity flip、temporal reverse。
+
+结果文件：
+
+    outputs/exp1_follow_20260711_128/summary.md
+
+
+## 9.2 BRG 结构消融
+
+状态：已完成。
+
+完成的 variants：
+
+- Full BRG。
+- BRG without gate regularization。
+- Scalar gated cross-attention。
+- BRG with relaxed bounds。
+
+主要结论：
+
+- Full BRG 在 MVSEC 上明显优于 scalar cross-attention。
+- Full BRG 的 real event 在 DSEC/MVSEC 上均优于 zero 和 shuffle event。
+- 当前 3000-step 设置下，移除 gate regularization 几乎不改变精度。
+- Relaxed bounds 发生数值发散，证明 bounded residual 对稳定性是必要的。
+
+详细结果：
+
+    outputs/exp1_ablation_training_summary_20260711.txt
+
+
+## 9.3 Old split 跨场景泛化
+
+状态：已完成。
+
+协议：
+
+- MVSEC-old：8 scenes x 16 adjacent pairs，共 128 pairs。
+- DSEC-old：128 fixed adjacent pairs。
+- 所有方法使用完全一致的 sample IDs。
+
+DSEC-old Raw AbsRel：
+
+| Method | Raw AbsRel ↓ | Raw delta1 ↑ |
+|---|---:|---:|
+| MASt3R | 0.4437 | 0.0035 |
+| Dark3R LoRA | 0.6376 | 0.0003 |
+| MVSEC-specialized Night3R | 0.0883 | 0.9556 |
+| VATS300 | 0.1199 | 0.9153 |
+| Mixed Night3R | 0.0616 | 0.9671 |
+
+MVSEC-old Raw AbsRel：
+
+| Method | Raw AbsRel ↓ | Raw delta1 ↑ |
+|---|---:|---:|
+| MASt3R | 0.5409 | 0.2438 |
+| Dark3R LoRA | 0.5399 | 0.0732 |
+| MVSEC-specialized Night3R | 0.2222 | 0.8135 |
+| VATS300 | 0.2105 | 0.8114 |
+| Mixed Night3R | 0.4346 | 0.3605 |
+
+结论：
+
+- Mixed Night3R 在 DSEC-old 上最好，Raw AbsRel 为 0.0616。
+- MVSEC-old 上 VATS300 的 Raw AbsRel 最低；MVSEC-specialized Night3R 在
+  delta1、RMSE、PSNR 和 median-aligned metrics 上最好。
+- Mixed Night3R 在 MVSEC-old 上仍明显优于 MASt3R/Dark3R，但存在 raw-scale
+  跨域校准问题。
+
+完整结果：
+
+    outputs/exp1_oldsplit_generalization_20260711/summary.md
+
+
+## 9.4 MVSEC-current 极暗 dark005
+
+状态：已完成。
+
+协议：固定 128 个相邻帧对，RGB exposure=0.05，event voxel 保持不变。
+
+| Method | Event | Raw AbsRel ↓ | Raw delta1 ↑ |
+|---|---|---:|---:|
+| MASt3R | none | 0.9181 | 0.0000 |
+| Dark3R LoRA | none | 0.6876 | 0.0499 |
+| MVSEC-specialized Night3R | real | 0.2094 | 0.7334 |
+| VATS300 | real | 0.2187 | 0.6941 |
+| Mixed Night3R | zero | 0.2807 | 0.6050 |
+| Mixed Night3R | real | 0.1670 | 0.8357 |
+
+结论：Mixed Night3R 使用 real event 后，相对 zero event 的 Raw AbsRel
+降低约 40.5%，证明极暗 RGB 条件下 event 提供了有效几何信息。
+
+完整结果：
+
+    outputs/exp1_dark005_extreme_20260711/summary.md
+
+DSEC-current dark005 也已完成：Mixed-real Raw AbsRel=0.0981，Mixed-zero
+Raw AbsRel=0.2944，真实事件降低约 66.7%。
+
+
+## 9.5 正在运行和已排队实验（2026-07-12）
+
+正在运行的单卡串行队列：
+
+- MVSEC/DSEC dark010 的 RGB baselines、Mixed real/zero event。
+- dark005/dark010 下的 shuffle、polarity flip、temporal reverse controls。
+
+评估队列后已排四个训练消融：
+
+- BRG no event statistics。
+- Legacy tensor gate。
+- Replace RGB token。
+- BRG no source-specific normalization。
+
+每个训练消融为 3000 steps，并自动评估 MVSEC-current 与 DSEC-current。
+
+追加的 8 卡并行训练状态：
+
+| GPU | Variant | 状态 |
+|---:|---|---|
+| 0 | BRG no event statistics | running |
+| 1 | Legacy tensor gate | running |
+| 2 | Replace RGB token | running |
+| 3 | BRG no source normalization | running |
+| 4 | Density statistic only | running |
+| 5 | Occupancy statistic only | running |
+| 6 | Polarity statistic only | running |
+| 7 | Density + occupancy, no polarity | running |
+
+这四个统计组成消融使用固定 stat mask，只改变 BRG gate 可见的统计分量。
+训练完成后自动评估 MVSEC-current 和 DSEC-current，并并行补齐剩余 dark controls。
+"""
+
+out="/mnt/data/Night3R_experiment_plan.md"
+pypandoc.convert_text(content, 'md', format='md', outputfile=out, extra_args=['--standalone'])
+out
+
+
+## 9.6 下一批实验队列（2026-07-12）
+
+上一批 BRG 结构消融与 dark005/dark010 controls 已完成。本批实验用于补齐
+DSEC 公平对照、数据集适配对照和论文效率统计。由于启动时 GPU 0--7 均被其他
+进程占用，所有任务均通过空闲守卫排队，未直接申请显存。
+
+空闲守卫启动条件：目标 GPU 的已用显存不超过 22000 MiB、GPU utilization
+不超过 10%，并且连续 3 次轮询满足条件；轮询间隔为 20 秒。这样可以避免在
+现有任务短暂降载时误启动，并降低 OOM 风险。
+
+| GPU | tmux session | 实验 | 主要输出 |
+|---:|---|---|---|
+| 0 | exp1_next_g0_full128_0712 | Full BRG，DSEC-current 公平 128-pair 评估 | outputs/exp1_fair_dsec128_20260712/full_brg/dsec_current_real_128.json |
+| 1 | exp1_next_g1_noreg128_0712 | No gate regularization，DSEC-current 公平 128-pair 评估 | outputs/exp1_fair_dsec128_20260712/no_gate_reg/dsec_current_real_128.json |
+| 2 | exp1_next_g2_scalar128_0712 | Scalar cross-attention，DSEC-current 公平 128-pair 评估 | outputs/exp1_fair_dsec128_20260712/scalar_crossattn/dsec_current_real_128.json |
+| 3 | exp1_next_g3_dseconly_0712 | DSEC-only BRG，单卡 3000-step 训练及自动评估 | outputs/exp1_dsec_only_brg_1gpu_3k_20260712 |
+| 4 | exp1_eff_g4_mast_0712 | MASt3R batch-1/512/BF16 效率测试 | outputs/exp1_efficiency_20260712/mast3r.json |
+| 5 | exp1_eff_g5_dark_0712 | Dark3R LoRA batch-1/512/BF16 效率测试 | outputs/exp1_efficiency_20260712/dark3r_lora.json |
+| 6 | exp1_eff_g6_mv1k_0712 | MVSEC-specialized Night3R batch-1/512/BF16 效率测试 | outputs/exp1_efficiency_20260712/night3r_mvsec_1k.json |
+| 7 | exp1_eff_g7_mixed_0712 | Mixed Night3R batch-1/512/BF16 效率测试 | outputs/exp1_efficiency_20260712/night3r_mixed.json |
+
+DSEC 公平评估统一使用同一组 128 个 sample IDs，解决此前 Full BRG 的 612-pair
+结果与新结构消融 128-pair 结果不能严格横向比较的问题。效率测试统一使用
+batch size 1、512 分辨率、BF16、10 次 warm-up 和 50 次正式计时，记录平均/
+中位/P90 latency、FPS、峰值 allocated/reserved VRAM、总参数量和参数存储量。
+
+队列创建时 GPU 0--7 的已用显存约为 28.8--34.2 GiB，利用率为 40%--100%，
+因此上述 8 个任务当前均处于等待状态；卡真正空闲后会自动开始。
+
+
+## 9.7 Dynamic Loss、监督项与数据组成补充实验（2026-07-14）
+
+2026-07-12 队列已经全部完成，包括 Mixed Night3R 效率测试。本轮为每张 GPU
+建立两层串行任务，共 16 个训练实验。每项训练使用相同 BRG 初始化、BF16、
+单卡、3000-step 上限；训练结束后自动评估 MVSEC-current 和 DSEC-current
+固定 128 pairs。评估统一关闭随机低光增强，避免测试时随机性。
+
+第一层任务：
+
+| GPU | tmux session | Variant | 目的 |
+|---:|---|---|---|
+| 0 | exp2_g0_nonorm_0714 | No active-loss normalization | 消融动态 active-weight normalization |
+| 1 | exp2_g1_uniform_0714 | Unit available-source weights | 消融 MVSEC/DSEC/source-specific loss scaling |
+| 2 | exp2_g2_noedge_0714 | No event-depth-edge loss | 验证 event edge 几何监督 |
+| 3 | exp2_g3_nograd_0714 | No depth-gradient loss | 验证局部深度边界监督 |
+| 4 | exp2_g4_nofeat_0714 | No feature distillation | 验证 MASt3R feature guardrail |
+| 5 | exp2_g5_nostruct_0714 | No structure consistency | 验证几何结构保持项 |
+| 6 | exp2_g6_mvonly_0714 | MVSEC-only BRG | 补齐严格数据组成对照 |
+| 7 | exp2_g7_noaug_0714 | No low-light augmentation | 验证训练低光增强的贡献 |
+
+第二层任务在同卡第一层 tmux 退出后才开始，并再次经过 GPU 空闲守卫：
+
+| GPU | tmux session | Variant | 目的 |
+|---:|---|---|---|
+| 0 | exp3_q0_fulls0_0714 | Full BRG seed 0 | 所有新消融的严格单卡参照 |
+| 1 | exp3_q1_fulls17_0714 | Full BRG seed 17 | 随机种子重复实验 |
+| 2 | exp3_q2_fulls31_0714 | Full BRG seed 31 | 随机种子重复实验 |
+| 3 | exp3_q3_nodepth_0714 | No metric depth loss | 验证 metric depth anchor |
+| 4 | exp3_q4_nophoto_0714 | No event-photo loss | 验证弱 photometric 辅助项 |
+| 5 | exp3_q5_nodl3dv_0714 | MVSEC + DSEC, no DL3DV | 严格检验 DL3DV 对泛化的贡献 |
+| 6 | exp3_q6_static_0714 | Static plain loss | 同时移除 active normalization 与非单位可用源权重 |
+| 7 | exp3_q7_nonoise_0714 | Exposure only, no shot/read noise | 分离曝光变暗与噪声增强贡献 |
+
+启动检查：GPU 0--5 第一层均已稳定训练，显存约 13.7--14.9 GiB，GPU
+utilization 约 50%--57%，无 OOM。GPU 6--7 原有进程分别占用约 39.9 GiB
+和 45.4 GiB，因此第一层保持等待，不会叠加模型。空闲守卫仍使用 22 GiB、
+10% utilization、连续三次轮询的启动条件。
+
+第一层输出统一位于：
+
+    outputs/exp2_*_20260714
+
+第二层输出统一位于：
+
+    outputs/exp3_*_20260714
+
+
+## 9.8 2026-07-14 队列完成结果
+
+状态：16/16 训练完成，全部达到 step 3000；16/16 均生成最终 checkpoint、
+MVSEC-current 128-pair JSON 和 DSEC-current 128-pair JSON。日志未发现
+Traceback、RuntimeError、CUDA OOM 或 non-finite-total-loss 终止。
+
+Full BRG 单卡三随机种子 Raw AbsRel：
+
+| Seed | MVSEC | DSEC |
+|---:|---:|---:|
+| 0 | 0.4493 | 0.0687 |
+| 17 | 0.4211 | 0.0753 |
+| 31 | 0.4517 | 0.0731 |
+| Mean +/- std | 0.4407 +/- 0.0139 | 0.0724 +/- 0.0027 |
+
+主要 loss 消融 Raw AbsRel：
+
+| Variant | MVSEC | DSEC |
+|---|---:|---:|
+| Full BRG seed 0 | 0.4493 | 0.0687 |
+| No active-loss normalization | 0.4548 | 0.0705 |
+| Unit available-source weights | 0.4537 | 0.0742 |
+| Static plain loss | 0.4523 | 0.0713 |
+| No event-depth-edge | 0.4553 | 0.0672 |
+| No depth-gradient | 0.4514 | 0.0685 |
+| No feature distillation | 0.4509 | 0.0682 |
+| No structure consistency | 0.4510 | 0.0691 |
+| No event-photo | 0.4516 | 0.0689 |
+| No metric depth | 0.4792 | 0.5349 |
+
+数据和增强消融 Raw AbsRel：
+
+| Variant | MVSEC | DSEC |
+|---|---:|---:|
+| MVSEC-only BRG | 0.4414 | 0.0940 |
+| MVSEC + DSEC, no DL3DV | 0.4450 | 0.0752 |
+| No low-light augmentation | 0.2060 | 0.0940 |
+| Exposure only, no shot/read noise | 0.2081 | 0.0931 |
+
+结论：metric depth loss 是最关键的 scale anchor；动态 active-loss normalization
+和 source-aware weighting 带来较小但一致的稳定收益。MVSEC-only、no-DL3DV
+和去噪声增强均呈现 MVSEC 改善、DSEC 退化，说明当前 mixed/noise recipe 的主要
+作用是提升跨域与 DSEC 鲁棒性，而不是单独追求 MVSEC specialization。
+
+详细汇总：
+
+    outputs/exp2_exp3_loss_data_summary_20260714.txt
+
+
+## 9.9 结构与低光造数矩阵补全实验（2026-07-14）
+
+本轮不做随机种子重复，只使用 GPU 0--5。六项训练均继承相同 Full BRG
+初始化、损失、数据源和 3000-step 上限，只改变表中指定变量。训练结束后自动
+评估 MVSEC-current 和 DSEC-current 固定 128 pairs。
+
+| GPU | tmux session | Variant | 补全目的 |
+|---:|---|---|---|
+| 0 | exp4_g0_patchfusion_0714 | Event patch embedding + BRG fusion only | 验证是否必须微调深层 event encoder |
+| 1 | exp4_g1_nosrcbias_0714 | No source bias, keep source stat norm | 单独隔离 source bias |
+| 2 | exp4_g2_nosrcnorm_0714 | No source stat norm, keep source bias | 单独隔离 source-specific normalization |
+| 3 | exp4_g3_srgb_0714 | Direct sRGB-domain low-light augmentation | 对比 inverse-gamma linear-domain 路线 |
+| 4 | exp4_g4_noiseonly_0714 | Shot/read noise only, exposure=1 | 补齐 exposure/noise 2x2 的 noise-only 单元 |
+| 5 | exp4_g5_fixed010_0714 | Fixed exposure=0.10 + noise | 对比固定曝光与连续 log-uniform 曝光训练 |
+
+启动验证：六项均已进入 step 400；GPU 0--5 显存约 9.7--14.0 GiB，未发现
+Traceback、RuntimeError、CUDA OOM 或 non-finite loss。GPU 6--7 未创建本轮
+任务并保持空闲。
+
+输出位置：
+
+    outputs/exp4_*_20260714
+
+后续控制实验已经为 GPU 0--5 各排一层串行队列：
+
+| GPU | Follow-up tmux | 对应模型 |
+|---:|---|---|
+| 0 | exp4c_g0_patchfusion_0714 | Patch + fusion only |
+| 1 | exp4c_g1_nosrcbias_0714 | No source bias only |
+| 2 | exp4c_g2_nosrcnorm_0714 | No source stat norm only |
+| 3 | exp4c_g3_srgb_0714 | Direct sRGB low-light |
+| 4 | exp4c_g4_noiseonly_0714 | Noise-only augmentation |
+| 5 | exp4c_g5_fixed010_0714 | Fixed exposure 0.10 |
+
+每个 follow-up 在对应训练 tmux 退出后才启动，并重新检查 GPU 空闲状态。对
+MVSEC-current 和 DSEC-current 分别补 zero event、shuffle event，各 128 pairs；
+连同训练后已有的 real-event 结果，每个新模型最终都有 real/zero/shuffle 完整
+对照。本层共新增 6 x 2 x 2 = 24 个评估，输出位于各自目录：
+
+    outputs/exp4_*/eval_event_controls
+
+Demo 候选挖掘也已追加到 GPU 0 的第三层串行队列：
+
+    tmux: demo_mine_q0_0714
+    depends on: exp4c_g0_patchfusion_0714
+    output: outputs/demo_candidate_mining_20260714
+
+该任务使用最终 Mixed Night3R、真实 MASt3R 和 Night3R zero-event 三种预测，
+分别遍历 MVSEC-current 与 DSEC-current 最多 256 pairs。候选分数同时考虑
+Night3R 相对 MASt3R 的 median-aligned AbsRel 改善，以及 real event 相对
+zero event 的改善；先按场景/连续索引 bucket 保留最佳样本，再为每个数据集
+保存最多 12 个候选。
+
+每个候选保存：RGB 双视图、event voxel 压缩数组、event activity、BRG gate、
+GT/MASt3R/Night3R-real/Night3R-zero 深度数组、共享尺度 comparison panel 和
+单样本 metrics.json。根目录同时生成 manifest.json、ranking.csv 与 index.html，
+便于后续自动选择 demo 场景并重新渲染，而不依赖截图。
+
+
+## 9.10 最终测试协议补全队列（2026-07-15）
+
+仅使用 GPU 0--3，每张卡两层串行任务；GPU 4--7 不使用。
+
+第一层：
+
+| GPU | tmux | 任务 | 输出 |
+|---:|---|---|---|
+| 0 | exp5_g0_demo_0715 | 修复后重新遍历 demo candidates | outputs/demo_candidate_mining_20260714 |
+| 1 | exp5_g1_eff_0715 | 四种方法在同一 GPU 上串行效率测试，20 warm-up + 100 iterations | outputs/exp5_efficiency_serial_same_gpu_20260715 |
+| 2 | exp5_g2_pairmv_0715 | MVSEC stride=1/3/5/7，四种方法各 128 pairs | outputs/exp5_pair_distance_20260715/mvsec |
+| 3 | exp5_g3_pairds_0715 | DSEC stride=1/3/5/7，四种方法各 128 pairs | outputs/exp5_pair_distance_20260715/dsec |
+
+Pair-distance 的四种方法为 MASt3R、Dark3R LoRA、MVSEC-specialized Night3R
+和 Mixed Night3R，用于检查结论是否只在相邻帧成立。
+
+第二层：
+
+| GPU | tmux | 任务 | 输出 |
+|---:|---|---|---|
+| 0 | exp5q_g0_expmv_0715 | MVSEC exposure=0.03/0.05/0.10/0.20/0.50/1.00 | outputs/exp5_exposure_curve_20260715/mvsec |
+| 1 | exp5q_g1_expds_0715 | DSEC exposure=0.03/0.05/0.10/0.20/0.50/1.00 | outputs/exp5_exposure_curve_20260715/dsec |
+| 2 | exp5q_g2_corrmv_0715 | MVSEC event dropout 25/50/75% 与 hot pixels | outputs/exp5_event_corruption_20260715/mvsec |
+| 3 | exp5q_g3_corrds_0715 | DSEC event dropout 25/50/75% 与 hot pixels | outputs/exp5_event_corruption_20260715/dsec |
+
+曝光曲线在每个曝光档同时评估 MASt3R、Mixed-real 和 Mixed-zero，各固定
+128 pairs。Event corruption 使用确定性空间掩码和确定性稀疏 hot-pixel 注入，
+不改变 RGB、GT、event shape 或 sample IDs，可复现且支持断点跳过已有 JSON。
+
+启动后检查：demo 已遍历 MVSEC 256 pairs 并继续 DSEC；同卡效率 4/4 JSON
+已生成；MVSEC/DSEC pair-distance 各已生成 5/16 JSON，未发现运行错误。

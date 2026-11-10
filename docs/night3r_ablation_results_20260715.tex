@@ -1,0 +1,518 @@
+\documentclass[10pt]{article}
+\usepackage[margin=1.7cm]{geometry}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\newcommand{\best}[1]{\textbf{#1}}
+\newcommand{\run}{\textcolor{orange!80!black}{Running}}
+\newcommand{\down}{\ensuremath{\downarrow}}
+\newcommand{\up}{\ensuremath{\uparrow}}
+
+\title{Night3R: Current Ablation Experiments}
+\author{}
+\date{July 16, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Final MVSEC Model Selection}
+
+The final reported MVSEC model is \emph{not} the mixed-training checkpoint used
+as the common starting point for controlled ablations.  The final MVSEC weight
+is fixed to
+\begin{center}
+\path{outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth}.
+\end{center}
+All final MVSEC main-result, comparison, robustness, and visualization numbers
+must use this checkpoint together with
+\path{config/train_night3r_mvsec_only_adapt_1k_from_best.yaml}.  In particular,
+the mixed-model MVSEC result (Raw AbsRel 0.4091) is only a cross-domain mixed
+model diagnostic and must not be presented as the final MVSEC result.
+
+\begin{table}[h]
+\centering
+\caption{Final reported MVSEC checkpoint.  These are the final-model results,
+not the common reference values used inside the ablation tables.}
+\label{tab:final-mvsec}
+\begin{tabular}{llrrrr}
+\toprule
+Split & Event & Raw AbsRel \down & Raw $\delta_1$ \up & Median AbsRel \down & Median $\delta_1$ \up \\
+\midrule
+MVSEC-current & Real & \best{0.2073} & \best{0.8118} & \best{0.1949} & \best{0.8016} \\
+MVSEC-current & Zero & 0.6798 & 0.2057 & 0.4216 & 0.3514 \\
+MVSEC-current & Shuffle & 0.3165 & 0.5754 & 0.3122 & 0.5027 \\
+\midrule
+MVSEC-old & Real & \best{0.2222} & \best{0.8135} & \best{0.1922} & \best{0.7814} \\
+MVSEC-old & Zero & 0.7585 & 0.1891 & 0.3625 & 0.4454 \\
+MVSEC-old & Shuffle & 0.3060 & 0.5762 & 0.3099 & 0.4896 \\
+\midrule
+DSEC-current & Real & \best{0.1356} & \best{0.8373} & \best{0.0559} & \best{0.9826} \\
+DSEC-current & Zero & 0.3101 & 0.2689 & 0.1071 & 0.9176 \\
+DSEC-current & Shuffle & 0.1833 & 0.6305 & 0.0866 & 0.9188 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The final checkpoint reduces MVSEC-current Raw AbsRel from 0.5880 for MASt3R
+to 0.2073.  Real events also clearly outperform zero and shuffled events under
+the same final weight.  The later VATS continuation is retained as a separate
+experimental variant; it is not substituted for the selected final MVSEC
+checkpoint.
+
+On MVSEC-current, real events reduce Raw AbsRel by 69.5\% relative to zero
+events and by 34.5\% relative to shuffled events.  On DSEC-current, the
+corresponding reductions are 56.3\% and 26.0\%.  The strict ordering
+real $<$ shuffle $<$ zero on both datasets shows that the final model benefits
+from event presence and, more importantly, from correct event--RGB alignment.
+The MVSEC warp PSNR changes by less than 0.1 dB across the three modes, so the
+depth metrics are substantially more sensitive to event correctness than this
+pairwise photometric diagnostic.
+
+\begin{table}[h]
+\centering
+\caption{DL3DV event-path diagnostics for the selected final checkpoint.  The
+full local DL3DV eval root has no metric depth ground truth or usable warp
+supervision in this evaluator, so these are diagnostic rather than accuracy
+metrics.}
+\label{tab:final-dl3dv-control}
+\begin{tabular}{lrrr}
+\toprule
+Event & Gate mean & Event density & Event occupancy \\
+\midrule
+Real & 0.01918 & 0.5803 & 0.6115 \\
+Zero & 0.00000 & 0.0000 & 0.0000 \\
+Shuffle & 0.01916 & 0.5803 & 0.6115 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Real and shuffled DL3DV events have almost identical marginal statistics and
+mean gates, as intended by the shuffle control.  Because no quality metric is
+available on this root, these rows confirm execution and distribution
+preservation but cannot establish that real alignment improves DL3DV geometry.
+
+\section{Experimental Protocol}
+
+Unless otherwise stated, all single-GPU ablations use the same initialization,
+data, optimizer, and evaluation protocol.  The model is initialized from the
+same 3k-step Night3R checkpoint.  The MASt3R RGB backbone and prediction head
+are frozen, while the event encoder and the selected fusion adapter are trained
+for 3000 steps.  Training uses BF16, batch size 1, balanced sampling over
+MVSEC, the DSEC holdout training split, and DL3DV, and seed 0.  The event tensor
+contains four temporal bins with separate positive and negative polarities,
+giving eight input channels.  Images are resized to $512\times512$.
+
+All main ablation results are evaluated with real events, no test-time low-light
+augmentation, and 128 fixed adjacent pairs from MVSEC-current and DSEC-current.
+The primary metric is raw metric-depth AbsRel; lower is better.  The same sample
+selection and seed 17 are used for all evaluations.  Zero-event and shuffled-
+event controls are additionally reported where available.
+
+The earlier core BRG comparison used two GPUs but the same 3000-step budget.
+It is therefore shown separately from the strict single-GPU table and should
+not be numerically mixed with the single-GPU reference when computing small
+deltas.
+
+This separation is intentional: the final MVSEC checkpoint is used for the
+paper's MVSEC main result, whereas module/loss/data ablations use one shared
+pre-adaptation initialization so that the effect of the changed factor is not
+confounded by target-domain MVSEC adaptation.
+
+\section{Fusion and BRG Ablations}
+
+\subsection{Core BRG Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Core fusion and BRG design ablations.  The first four rows use the
+earlier 2-GPU 3k-step protocol.  The remaining completed rows use the 1-GPU
+3k-step protocol.  All values are raw AbsRel.}
+\label{tab:fusion}
+\begin{tabular}{lccc}
+\toprule
+Variant & Protocol & MVSEC \down & DSEC \down \\
+\midrule
+Full bounded reliability gate (BRG) & 2-GPU & \best{0.4356} & 0.0844 \\
+BRG without gate regularization & 2-GPU & 0.4358 & \best{0.0842} \\
+Scalar gated cross-attention & 2-GPU & 0.5403 & 0.0866 \\
+BRG with relaxed bounds & 2-GPU & Diverged & Diverged \\
+\midrule
+BRG without event statistics & 1-GPU & 0.4509 & 0.0665 \\
+Legacy channel-wise tensor gate & 1-GPU & 0.7600 & 0.0728 \\
+Replace RGB token by bounded event residual & 1-GPU & 0.2266 & 0.1986 \\
+Concatenate RGB/event tokens + MLP residual & 1-GPU & 0.5499 & \best{0.0626} \\
+Add projected event token to RGB token & 1-GPU & 0.5762 & 0.1028 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The scalar cross-attention baseline computes an event-conditioned attention
+update but applies one global learned scalar to every sample and token.  Its
+gate standard deviation is exactly zero.  In contrast, BRG predicts a spatial
+token gate from event reliability statistics.  Full BRG reduces MVSEC AbsRel
+from 0.5403 to 0.4356, a relative reduction of 19.4\%, while also improving
+DSEC from 0.0866 to 0.0844.  This gap is largest on MVSEC, where event sparsity
+and local reliability vary strongly across the image.
+
+Removing gate regularization changes little under the conservative 3000-step
+setting because the learned gate remains below its regularization caps.  Thus,
+this experiment supports describing the regularizer as a stability safeguard,
+not as the main source of accuracy.  Relaxing the residual bounds causes the
+event scale to grow from approximately 0.0309 to 2.57 and produces non-finite
+depth.  This directly supports the bounded-residual design: the bounds protect
+the pretrained MASt3R token distribution from an uncontrolled event update.
+
+The legacy tensor baseline is not a concat baseline.  It concatenates features
+only to predict a per-channel sigmoid gate and then injects gated event tokens.
+The two explicit conventional baselines use the same shared initialization and
+an initial residual scale of 0.035.  Concatenation followed by an MLP obtains
+0.5499 on MVSEC and 0.0626 on DSEC, exposing a strong cross-domain tradeoff:
+it improves DSEC but is substantially worse than BRG on MVSEC.  Unconditional
+additive projection is worse on both splits (0.5762/0.1028).  These results
+support reliability-conditioned bounded injection over a fixed additive event
+residual; they do not support a universal DSEC advantage for BRG over concat.
+
+\subsection{Event-Statistic and Source Calibration}
+
+\begin{table}[h]
+\centering
+\caption{BRG reliability-statistic and source-calibration ablations under the
+single-GPU 3k-step protocol.}
+\label{tab:stats}
+\begin{tabular}{lcc}
+\toprule
+Variant & MVSEC AbsRel \down & DSEC AbsRel \down \\
+\midrule
+Full BRG, seed 0 & 0.4493 & 0.0687 \\
+No event-stat conditioning & 0.4509 & \best{0.0665} \\
+Density only & 0.4513 & 0.0686 \\
+Occupancy only & 0.4530 & 0.0682 \\
+Polarity balance only & 0.4524 & 0.0680 \\
+Density + occupancy, no polarity & 0.4518 & 0.0690 \\
+No source bias or source-stat normalization & \best{0.4401} & 0.0718 \\
+No source bias only & 0.4403 & 0.0714 \\
+No source-stat normalization only & 0.4511 & 0.0687 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The three event statistics are log density, occupancy, and polarity balance.
+Their individual 3k-step differences are small, so the current evidence does
+not justify claiming that one component independently dominates.  Source-aware
+calibration shows a cross-domain tradeoff: removing source bias improves MVSEC
+but degrades DSEC.  Its main purpose is therefore mixed-dataset calibration,
+not a universal per-dataset gain.
+
+\subsection{Event-Input Controls}
+
+\begin{table}[h]
+\centering
+\caption{Final MVSEC-only 1k checkpoint under real, zero, and shuffled events.
+Shuffling preserves the event value distribution while breaking
+spatial/temporal alignment.}
+\label{tab:event-control}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Event & Raw AbsRel \down & Raw $\delta_1$ \up & Median AbsRel \down & Median $\delta_1$ \up \\
+\midrule
+\multirow{3}{*}{DSEC} & Real & \best{0.1356} & \best{0.8373} & \best{0.0559} & \best{0.9826} \\
+ & Zero & 0.3101 & 0.2689 & 0.1071 & 0.9176 \\
+ & Shuffle & 0.1833 & 0.6305 & 0.0866 & 0.9188 \\
+\midrule
+\multirow{3}{*}{MVSEC} & Real & \best{0.2073} & \best{0.8118} & \best{0.1949} & \best{0.8016} \\
+ & Zero & 0.6798 & 0.2057 & 0.4216 & 0.3514 \\
+ & Shuffle & 0.3165 & 0.5754 & 0.3122 & 0.5027 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Real events outperform both controls on both datasets.  Relative to zero
+events, real events reduce raw AbsRel by 56.3\% on DSEC and 69.5\% on MVSEC;
+relative to shuffled events, the reductions are 26.0\% and 34.5\%.  Real and
+shuffled inputs have nearly identical event density, occupancy, and mean gate
+values.  This is expected because the deterministic circular spatial/bin shift
+preserves every event value while breaking event--RGB alignment.  The accuracy
+gap therefore measures aligned event content rather than event count or average
+fusion strength.
+
+\paragraph{Trajectory controls.}
+For MVSEC and DL3DV, relative poses are recovered by trimmed Sim(3)
+registration of bidirectional point maps.  Both MASt3R head directions are
+tested and the lower-residual direction is retained.  Translation is normalized
+per edge, 32 adjacent-frame poses are chained, and EVO applies one Sim(3)
+alignment per scene.  Values below are means of per-scene RMSE over six scenes.
+DSEC is unavailable because its local test export has no pose ground truth.
+These trajectory numbers use stored RGB without test-time low-light
+augmentation.  MVSEC is a real night sequence; the DL3DV export records
+\texttt{image\_mode=copy} and therefore uses source RGB rather than synthetic
+darkening.
+
+\begin{table*}[t]
+\centering
+\caption{ATE and RPE for the final MVSEC-only 1k checkpoint.  Lower is better.}
+\label{tab:event-control-pose}
+\begin{tabular}{llrrr}
+\toprule
+Dataset & Input/model & ATE (m) $\downarrow$ & RPE trans. (m) $\downarrow$ & RPE rot. ($^\circ$) $\downarrow$ \\
+\midrule
+\multirow{4}{*}{MVSEC} & MASt3R & \textbf{0.3705} & \textbf{0.2557} & \textbf{6.44} \\
+ & Real & 0.3822 & 0.2829 & 95.77 \\
+ & Zero & 0.4707 & 0.3613 & 133.19 \\
+ & Shuffle & 0.4992 & 0.3086 & 111.56 \\
+\midrule
+\multirow{4}{*}{DL3DV} & MASt3R & \textbf{0.2570} & \textbf{0.1426} & \textbf{1.60} \\
+ & Real & 0.4289 & 0.3151 & 153.71 \\
+ & Zero & 0.4984 & 0.3290 & 155.16 \\
+ & Shuffle & 0.3053 & 0.2516 & 139.71 \\
+\midrule
+DSEC & \multicolumn{4}{l}{Not available: no camera-pose ground truth.} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+On MVSEC, real events reduce ATE by 18.8\% relative to zero events and by
+23.4\% relative to shuffled events; translational RPE is reduced by 21.7\% and
+8.4\%, respectively.  DL3DV does not show the same ordering: real improves over
+zero, but shuffle has lower translation error.  The large Night3R rotation RPE
+and normalized point-map residuals, compared with MASt3R, show that this final
+depth-adapted checkpoint does not improve pose estimation.  The pose table is
+therefore a diagnostic of event-input behavior and cross-view XYZ consistency,
+not evidence of a pose state of the art.
+
+A separate deterministic DL3DV darken test was run at exposures 0.20, 0.10,
+and 0.05 with shot/read noise 0.01.  MASt3R remains stable, with ATE
+0.2495/0.2368/0.2489 and rotation RPE 1.76/2.19/3.11 degrees.  Night3R with
+real events obtains ATE 0.4502/0.4533/0.4124 and rotation RPE
+156.12/156.54/156.79 degrees; zero and shuffled controls have similarly large
+rotation error and no consistent ordering.  Thus explicit darkening does not
+repair the final checkpoint's cross-view XYZ inconsistency, and this pose
+diagnostic is not used as positive evidence.
+
+\section{Dynamic Loss and Supervision Ablations}
+
+For a sample with active loss set $\mathcal{A}$, the implemented objective is
+\begin{equation}
+  \mathcal{L}_{\mathrm{dyn}}
+  = \frac{w_{\mathrm{target}}}
+  {\max(\sum_{k\in\mathcal{A}} w_k,\epsilon)}
+  \sum_{k\in\mathcal{A}} w_k\mathcal{L}_k,
+\end{equation}
+where source-aware multipliers modify $w_k$ for MVSEC, DSEC, and DL3DV.  A term
+is excluded from both sums when its required supervision is unavailable.  This
+prevents the overall gradient scale from changing simply because different
+datasets expose different labels.
+
+\begin{table}[h]
+\centering
+\caption{Dynamic-loss and supervision ablations.}
+\label{tab:loss}
+\begin{tabular}{lcc}
+\toprule
+Variant & MVSEC AbsRel \down & DSEC AbsRel \down \\
+\midrule
+Full BRG, seed 0 & \best{0.4493} & 0.0687 \\
+No active-loss normalization & 0.4548 & 0.0705 \\
+Unit source weights & 0.4537 & 0.0742 \\
+Static plain loss & 0.4523 & 0.0713 \\
+No event-depth-edge loss & 0.4553 & \best{0.0672} \\
+No depth-gradient loss & 0.4514 & 0.0685 \\
+No feature distillation & 0.4509 & 0.0682 \\
+No structure consistency & 0.4510 & 0.0691 \\
+No event-photo loss & 0.4516 & 0.0689 \\
+No metric-depth loss & 0.4792 & 0.5349 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The largest failure occurs without metric-depth supervision, especially on
+DSEC, where AbsRel increases from 0.0687 to 0.5349.  Sparse metric depth is the
+main scale anchor.  Active-loss normalization and source-aware weights provide
+smaller but consistent mixed-dataset benefits.  The differences from removing
+individual auxiliary terms are modest at 3000 steps and should not be
+overstated.
+
+\section{Dataset and Low-Light Ablations}
+
+\subsection{Training-Data Composition}
+
+\begin{table}[h]
+\centering
+\caption{Dataset-composition ablations.}
+\label{tab:data}
+\begin{tabular}{lcc}
+\toprule
+Training data & MVSEC AbsRel \down & DSEC AbsRel \down \\
+\midrule
+MVSEC + DSEC + DL3DV & 0.4493 & \best{0.0687} \\
+MVSEC only & \best{0.4414} & 0.0940 \\
+MVSEC + DSEC, without DL3DV & 0.4450 & 0.0752 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MVSEC-only training improves the in-domain MVSEC result but substantially
+degrades DSEC.  Removing DL3DV has the same, weaker pattern.  DL3DV therefore
+acts mainly as a cross-domain regularizer in the current mixed training setup.
+
+\subsection{Low-Light Generation Route}
+
+The default physically motivated route first approximates a linear sensor
+domain using inverse gamma, applies exposure scaling there, adds
+signal-dependent shot noise and signal-independent read noise, clips, and then
+returns to sRGB with gamma encoding:
+\begin{align}
+ I_{\mathrm{lin}} &= I_{\mathrm{sRGB}}^{\gamma}, \\
+ I_e &= e I_{\mathrm{lin}},\qquad
+ e\sim\mathrm{LogUniform}(0.03,1.0), \\
+ \widetilde I_{\mathrm{lin}} &= I_e
+ + \sigma_s\sqrt{I_e+\epsilon}\,\eta_s
+ + \sigma_r\eta_r, \\
+ I_{\mathrm{dark}} &=
+ \mathrm{clip}(\widetilde I_{\mathrm{lin}},0,1)^{1/\gamma},
+ \qquad \gamma=2.2.
+\end{align}
+This route is physically better motivated than adding Gaussian noise after
+gamma compression because photon shot noise and electronic read noise originate
+before the camera response curve.  It remains an approximation to RAW rather
+than a claim of exact sensor simulation, since the source images have already
+passed through an unknown ISP.
+
+\begin{table}[h]
+\centering
+\caption{Low-light training ablations under the single-GPU 3k-step protocol.}
+\label{tab:lowlight}
+\begin{tabular}{p{7.7cm}cc}
+\toprule
+Variant & MVSEC AbsRel \down & DSEC AbsRel \down \\
+\midrule
+Linear domain, log-uniform exposure, shot + read noise (default) & 0.4493 & 0.0687 \\
+No low-light augmentation & \best{0.2060} & 0.0940 \\
+Linear domain, exposure only, no noise & 0.2081 & 0.0931 \\
+Direct sRGB exposure, shot + read noise & 0.3918 & \best{0.0649} \\
+Linear domain, fixed exposure $e=0.1$, shot + read noise & 0.4542 & 0.0747 \\
+Linear domain, no exposure darkening, shot + read noise & 0.4323 & 0.0659 \\
+Direct sRGB exposure, no noise & 0.2127 & 0.0859 \\
+Linear domain, exposure + read noise only & 0.4445 & 0.0678 \\
+Linear domain, exposure + shot noise only & 0.3024 & 0.0786 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The completed factorial evidence shows that exposure scaling without noise
+behaves similarly to no augmentation on MVSEC, while noise is important for
+DSEC robustness.  Direct sRGB exposure without noise obtains 0.2127/0.0859,
+close to the no-augmentation and linear exposure-only variants.  Adding shot
+and read noise in sRGB improves DSEC to 0.0649 but degrades MVSEC to 0.3918.
+In the linear route, read-only noise (0.4445/0.0678) nearly reproduces the
+default shot-plus-read result (0.4493/0.0687), whereas shot-only noise shifts
+the tradeoff toward MVSEC (0.3024) at the cost of DSEC (0.0786).  Thus read
+noise is the main contributor to the default route's DSEC behavior, while shot
+noise contributes more of the MVSEC gain.  The results support the physical
+motivation of linear-domain noise, but direct sRGB darkening remains the better
+empirical DSEC variant at this training budget.
+
+\subsection{Distribution-Level Low-Light Check}
+
+On 240 real MVSEC night images and 240 DL3DV source images, direct sRGB
+multiplication at $e=0.03$ obtains the lowest selected histogram/statistics
+distance (0.652), followed by direct sRGB $e=0.05$ (0.728).  Linear exposure at
+$e=0.03$ obtains 1.063, clean source images obtain 1.919, and the current linear
+shot/read simulation at $e=0.03$ obtains 2.122.  These statistics indicate that
+a simple sRGB transform can match this particular MVSEC intensity histogram
+more closely.  Histogram matching, however, is not equivalent to sensor
+physical correctness: it conflates source-scene illumination, camera response,
+black-level clipping, denoising, and tone mapping.  The paper should therefore
+report both the distribution check and the downstream reconstruction ablation.
+
+\section{Extreme-Low-Light Robustness}
+
+\begin{table*}[t]
+\centering
+\caption{DSEC depth accuracy for the final MVSEC-only 1k checkpoint under
+controlled synthetic low light.  RGB is inverse-gamma linearized, multiplied
+by a fixed exposure, and corrupted by shot/read noise 0.01.  All methods receive
+identical darkened RGB over 128 fixed adjacent pairs.}
+\label{tab:final-dsec-darken-depth}
+\begin{tabular}{clrrrr}
+\toprule
+Exposure & Input/model & Raw AbsRel $\downarrow$ & Raw $\delta_1$ $\uparrow$ & Median AbsRel $\downarrow$ & Median $\delta_1$ $\uparrow$ \\
+\midrule
+\multirow{5}{*}{0.20} & MASt3R & 0.3907 & 0.0602 & 0.1623 & 0.7494 \\
+ & Dark3R & 0.5885 & 0.0002 & 0.1632 & 0.7585 \\
+ & Real & 0.1611 & 0.7128 & \best{0.0710} & \best{0.9679} \\
+ & Zero & \best{0.1182} & \best{0.8420} & 0.1096 & 0.8882 \\
+ & Shuffle & 0.1868 & 0.6256 & 0.1410 & 0.7920 \\
+\midrule
+\multirow{5}{*}{0.10} & MASt3R & 0.5450 & 0.0082 & 0.2610 & 0.5263 \\
+ & Dark3R & 0.6573 & 0.0000 & 0.1998 & 0.6591 \\
+ & Real & 0.1727 & 0.6503 & \best{0.0796} & \best{0.9565} \\
+ & Zero & \best{0.1393} & \best{0.7839} & 0.1325 & 0.8226 \\
+ & Shuffle & 0.2105 & 0.5525 & 0.1684 & 0.7308 \\
+\midrule
+\multirow{5}{*}{0.05} & MASt3R & 0.8724 & 0.0008 & 0.4914 & 0.3486 \\
+ & Dark3R & 0.8102 & 0.0000 & 0.2839 & 0.5164 \\
+ & Real & \best{0.1859} & \best{0.5861} & \best{0.0934} & \best{0.9301} \\
+ & Zero & 0.3479 & 0.2341 & 0.1939 & 0.7317 \\
+ & Shuffle & 0.2555 & 0.4132 & 0.2028 & 0.6611 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The sample-keyed noise generator produces identical RGB statistics for all four
+methods within each exposure.  At $e=0.05$, real events reduce Raw AbsRel by
+78.7\% relative to MASt3R, 77.1\% relative to Dark3R, 46.6\% relative to zero,
+and 27.2\% relative to shuffle.  Real events also reduce Median AbsRel by
+67.1\% relative to Dark3R, 51.8\% relative to zero, and 53.9\% relative to
+shuffle.  At $e=0.20$ and $e=0.10$, real events are best
+after median alignment, while zero events have lower raw-scale error.  This
+indicates a scale-calibration offset in the zero-event path rather than better
+relative geometry.  The strongest-darkness row provides the clearest evidence
+that correctly aligned events preserve depth when RGB visibility collapses.
+These are controlled robustness tests, not an exact simulation of a particular
+camera sensor.
+
+\section{Current Status and Reporting Guidance}
+
+All scheduled BRG, event-statistic, source-calibration, dynamic-loss,
+dataset-composition, robustness, pair-distance, exposure-curve, fusion, and
+low-light factorial jobs are complete.  The final-checkpoint DSEC darken
+Real/Zero/Shuffle/MASt3R/Dark3R matrix is also complete at three fixed
+exposures.  The
+concat-MLP, additive projection,
+direct-sRGB without noise, linear read-only noise, and linear shot-only noise
+checkpoints all reached 3000 steps and were evaluated with real, zero, and
+shuffled events on 128 fixed MVSEC-current and DSEC-current pairs.
+
+In parallel, the selected final MVSEC-only 1k checkpoint was re-evaluated
+with real, zero, and shuffled events on MVSEC-current, DSEC-current, and the
+full DL3DV evaluation root.  Each setting uses 128 fixed adjacent pairs.  The
+MVSEC/DSEC rows report metric-depth accuracy; DL3DV has no metric depth ground
+truth in the local format and is therefore reported with warp RGB PSNR and
+prediction-stability diagnostics.  This rerun explicitly uses
+\path{outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth} for
+all nine cells.  All nine runs are complete; the MVSEC/DSEC quality metrics are
+reported in Table~\ref{tab:final-mvsec}, and the DL3DV diagnostics are reported
+in Table~\ref{tab:final-dl3dv-control}.
+
+Trajectory controls are also complete for the final checkpoint and MASt3R on
+six 32-frame MVSEC and DL3DV scenes.  Table~\ref{tab:event-control-pose} reports
+ATE and RPE.  DSEC is excluded from pose evaluation because the local test
+export has no camera trajectory ground truth.
+
+Small single-seed differences should be reported cautiously.  Existing
+single-GPU Full-BRG repeats have MVSEC AbsRel $0.4407\pm0.0139$ and DSEC AbsRel
+$0.0724\pm0.0027$ (population standard deviation over three seeds).  The
+strongest current conclusions are the large real-vs-zero/shuffle event gaps,
+the failure after removing metric-depth supervision, and divergence after
+relaxing BRG bounds.  Differences of roughly 0.01 on MVSEC are not strong by
+themselves under the measured run-to-run variation.
+
+\end{document}

@@ -1,0 +1,1372 @@
+Night3R Method Draft for Overleaf
+Version date: 2026-07-06
+Repository: /data/fcr/data/Night3R
+
+================================================================================
+0. One-sentence summary
+================================================================================
+
+Night3R is a MASt3R-first RGB-event pairwise 3D reconstruction model for
+low-light and nighttime scenes. Instead of converting events into an image or
+using events to replace RGB features, Night3R directly encodes event voxels into
+MASt3R-compatible tokens and injects them into the pretrained RGB token stream
+through a reliability-aware bounded residual adapter.
+
+The central design idea is:
+
+    Event should not overwrite the RGB backbone.
+    Event should only act as a local, bounded, reliability-conditioned residual
+    correction in regions where event evidence is useful.
+
+This is the most important conceptual distinction from a simple RGB-event
+fusion baseline.
+
+================================================================================
+1. Problem Setting and Motivation
+================================================================================
+
+We consider pairwise 3D reconstruction from two RGB frames and their
+corresponding event measurements. Given an RGB image pair
+
+    (I_1, I_2)
+
+and event observations
+
+    (E_1, E_2),
+
+the goal is to predict dense pairwise 3D geometry in the same style as MASt3R:
+
+    pts3d for view 1,
+    pts3d_in_other_view for view 2,
+    confidence maps,
+    and optionally descriptors.
+
+The model remains compatible with the MASt3R output contract. Night3R does not
+introduce a separate global alignment module inside the fusion code. Pairwise
+prediction and downstream alignment/evaluation should remain conceptually
+separate.
+
+The motivation comes from low-light and nighttime RGB failure modes:
+
+1. Dark regions lose texture and local structure.
+2. Motion blur weakens RGB edge cues.
+3. Lamps, headlights, or reflections can saturate local regions.
+4. RGB noise and compression artifacts become stronger in underexposed areas.
+5. RGB-only MASt3R can hallucinate structure from prior knowledge and produce
+   scale drift, blocky depth, or missing object boundaries.
+
+Event cameras provide complementary information because they respond to
+brightness changes with high temporal resolution. In low light, events can
+still capture moving edges, object contours, road boundaries, poles, wheels,
+building outlines, and other local geometric cues that may be invisible in RGB.
+
+However, event measurements are not always reliable. Empty event regions,
+hot pixels, flicker, motion trails, and density bursts can all mislead the
+model. Therefore Night3R does not simply concatenate RGB and events. It first
+estimates token-level event reliability and then gates event residuals locally.
+
+================================================================================
+2. High-level Architecture
+================================================================================
+
+Night3R starts from a pretrained MASt3R/Dark3R-style RGB backbone. For each view
+v in {1,2}, the RGB image is encoded by the original RGB encoder:
+
+    R_v = Phi_rgb(I_v),
+
+where
+
+    R_v in R^{B x N x C}.
+
+Here B is the batch size, N is the number of image tokens, and C is the MASt3R
+token dimension.
+
+In parallel, each event voxel is encoded by an event token encoder:
+
+    Z_v = Phi_event(E_v),
+
+where
+
+    Z_v in R^{B x N x C}.
+
+The event token encoder is designed so that event tokens and RGB tokens have:
+
+1. the same token grid,
+2. the same feature dimension,
+3. compatible token semantics for downstream MASt3R decoding.
+
+The fused tokens are computed by a bounded reliability gate:
+
+    F_{v,i} = R_{v,i} + s_e * g_{v,i} * g^c_{v,i} * Delta Z_{v,i}.
+
+In this expression:
+
+    R_{v,i}       is the original RGB token at token i.
+    Delta Z_{v,i} is the projected event residual token.
+    s_e           is a bounded global event scale.
+    g_{v,i}       is a token-level event reliability gate.
+    g^c_{v,i}     is optional channel modulation.
+    F_{v,i}       is the fused token.
+
+In the final reported model, channel modulation is disabled:
+
+    g^c_{v,i} = 1.
+
+The fused tokens are then passed into the original MASt3R decoder and heads.
+This preserves the MASt3R output interface and allows direct comparison with
+MASt3R RGB-only baselines.
+
+================================================================================
+3. Event Voxel Representation
+================================================================================
+
+Each event is represented as
+
+    e_k = (x_k, y_k, t_k, p_k),
+
+where x_k and y_k are pixel coordinates, t_k is the timestamp, and p_k is the
+polarity. The polarity indicates whether log intensity increased or decreased.
+
+The final reported Night3R model uses:
+
+    num_bins = 4
+    polarity_separate = true
+    voxel_channels = 8
+
+Thus each event voxel contains 8 channels:
+
+    E = [E^+_1, E^+_2, E^+_3, E^+_4,
+         E^-_1, E^-_2, E^-_3, E^-_4].
+
+Positive-polarity events are accumulated into the first four temporal bins, and
+negative-polarity events are accumulated into the last four temporal bins.
+
+For a sequence of events in one event window, timestamps are normalized to the
+range [0, B_t - 1]:
+
+    t_tilde_k = ((t_k - t_min) / (t_max - t_min)) * (B_t - 1),
+
+where B_t = 4 in the current model.
+
+Temporal bilinear accumulation is then used:
+
+    b_l = floor(t_tilde_k),
+    b_r = min(b_l + 1, B_t - 1),
+    w_r = t_tilde_k - b_l,
+    w_l = 1 - w_r.
+
+The event contributes to both neighboring temporal bins:
+
+    E[b_l, y_k, x_k] += w_l,
+    E[b_r, y_k, x_k] += w_r.
+
+If polarity_separate is enabled, positive and negative events are accumulated
+into separate channel groups. Otherwise, polarity can be encoded by signed
+accumulation. Night3R's main model uses separate polarity channels.
+
+After voxelization, Night3R applies non-zero normalization. Only non-zero voxel
+entries are normalized:
+
+    E_nonzero <- (E_nonzero - mean(E_nonzero)) / std(E_nonzero).
+
+Zero entries remain zero. This matters because events are sparse. If zero
+regions were normalized with all values, empty event areas could become
+artificially non-zero and look like signal to the model. Non-zero normalization
+preserves sparsity while reducing sample-to-sample event count scale variation.
+
+================================================================================
+4. Direct Event Token Encoder
+================================================================================
+
+Night3R does not reconstruct event frames using E2VID or similar methods. It
+directly tokenizes the event voxel. The event voxel first goes through a
+convolutional patch embedding:
+
+    T_v = PatchEmbed(E_v).
+
+The patch size is matched to the MASt3R image encoder patch size. Therefore, if
+the RGB encoder produces a token grid H_t x W_t, the event encoder produces the
+same token grid.
+
+The event patch tokens are then processed by a copy of the MASt3R/Dark3R image
+encoder blocks:
+
+    Z_v = Enc_event(T_v).
+
+This design is important for three reasons.
+
+First, event tokens live in the same token grid and feature dimension as RGB
+tokens:
+
+    Z_v, R_v in R^{B x N x C}.
+
+Second, event features are learned directly for 3D geometry, rather than through
+an intermediate event-to-image reconstruction objective.
+
+Third, the downstream MASt3R decoder and heads can be reused without changing
+their output names or semantics.
+
+This makes the model a MASt3R-compatible adapter rather than an entirely new
+3D reconstruction architecture.
+
+================================================================================
+5. Why Scalar Fusion Is Not Enough
+================================================================================
+
+The initial Night3R scalar-g variant can be summarized as:
+
+    F_i = R_i + g * Delta Z_i,
+
+where g is a single global learnable scalar. This design has several problems.
+
+1. The same gate value is used for all images, all patches, and all regions.
+2. It cannot distinguish useful event regions from empty or noisy event regions.
+3. If g is too small, the model degenerates to RGB-only MASt3R.
+4. If g is too large, event features can corrupt the pretrained MASt3R token
+   distribution.
+5. Nighttime event usefulness is spatially local. Events around poles, wheels,
+   curbs, buildings, and moving boundaries may be useful, while sky, black
+   walls, empty areas, and sensor noise may not be.
+
+Night3R replaces this global scalar gate with a token-level reliability gate:
+
+    F_i = R_i + s_e * g_i * Delta Z_i.
+
+The gate g_i is computed from local event reliability statistics. Event fusion
+therefore becomes local, bounded, and interpretable.
+
+================================================================================
+6. Event Reliability Statistics
+================================================================================
+
+For each token region i, Night3R computes event reliability statistics from the
+raw event voxel. These statistics are not ground-truth reliability labels. They
+are cues used by the gate network.
+
+The final reported reliability statistics are:
+
+    density,
+    occupancy,
+    polarity balance.
+
+--------------------------------------------------------------------------------
+6.1 Event Density
+--------------------------------------------------------------------------------
+
+Event density measures local event activity:
+
+    d_i = log(1 + sum_{c,x,y in i} |E_{cxy}|).
+
+High density can indicate useful local structure, such as moving boundaries or
+object contours. However, density alone is not sufficient because hot pixels,
+flicker, and noise bursts can also create high density.
+
+--------------------------------------------------------------------------------
+6.2 Event Occupancy
+--------------------------------------------------------------------------------
+
+Event occupancy measures spatial support:
+
+    o_i = mean_{x,y in i} 1[sum_c |E_{cxy}| > 0].
+
+Occupancy helps distinguish a spatially coherent edge from a small number of
+isolated high-count pixels. A real edge or contour tends to occupy a coherent
+set of pixels, while noise may have low occupancy even if density is large.
+
+--------------------------------------------------------------------------------
+6.3 Polarity Balance
+--------------------------------------------------------------------------------
+
+Let P_i be the sum of positive-polarity event magnitudes in token region i, and
+N_i be the sum of negative-polarity event magnitudes. Night3R computes:
+
+    b_i = |P_i - N_i| / (P_i + N_i + epsilon).
+
+Polarity balance captures whether local events are dominated by one polarity.
+This is not a hard good/bad indicator. Some real motion boundaries may have
+polarity imbalance, but extreme imbalance can also indicate flicker, exposure
+artifacts, or local event bias. The model learns how to use this cue.
+
+--------------------------------------------------------------------------------
+6.4 Reliability Vector and Source-aware Normalization
+--------------------------------------------------------------------------------
+
+The reliability vector is:
+
+    r_i = [d_i, o_i, b_i].
+
+Night3R normalizes event statistics before feeding them to the gate:
+
+    r_hat_i = Norm(r_i).
+
+The implementation supports source-aware statistics because MVSEC, DSEC, and
+DL3DV have different event distributions:
+
+    mvsec -> 0
+    dsec  -> 1
+    dl3dv -> 2
+
+Source-aware normalization reduces the chance that the gate overfits raw event
+density scale from one dataset.
+
+================================================================================
+7. Bounded Reliability Gate (BRG)
+================================================================================
+
+The main fusion module is the Bounded Reliability Gate, abbreviated BRG.
+
+The BRG design principle is:
+
+    preserve the RGB token stream,
+    project event tokens into residual directions,
+    gate residuals with token-level reliability,
+    and bound the total event influence.
+
+--------------------------------------------------------------------------------
+7.1 Event Residual Branch
+--------------------------------------------------------------------------------
+
+The event token is normalized and projected:
+
+    Delta Z_i = P(LN(Z_i)),
+
+where P is an MLP. The projected event token is interpreted as a residual
+direction, not as a replacement token.
+
+The RGB token is kept as the residual base:
+
+    F_i = R_i + residual_i.
+
+This is important. If the model replaced RGB tokens with fully fused normalized
+tokens, it could easily destroy MASt3R's pretrained feature distribution.
+Night3R instead makes the event branch an adapter.
+
+--------------------------------------------------------------------------------
+7.2 Token-level Reliability Gate
+--------------------------------------------------------------------------------
+
+The gate logit is computed from normalized event reliability statistics:
+
+    l_i = MLP(r_hat_i) + b_source.
+
+Here b_source is an optional source-specific bias. It lets the model adjust
+initial event usage for datasets with different event statistics.
+
+The raw logit is bounded:
+
+    l_bar_i = L * tanh(l_i / L),
+
+where L is gate_logit_bound. This prevents the gate logit from becoming
+arbitrarily large and saturating the sigmoid.
+
+The token gate is:
+
+    g_i = c(t) * sigmoid(l_bar_i / tau),
+
+where:
+
+    c(t) is a gate-cap warmup schedule,
+    tau is the gate temperature.
+
+Then the gate is masked by event occupancy:
+
+    g_i <- g_i * 1[o_i > epsilon].
+
+If a token has no event evidence, event injection is automatically disabled for
+that token.
+
+The final reported model uses approximately:
+
+    gate_bias_init = -3.6
+    gate_logit_bound = 5.0
+    gate_temperature = 1.0
+    gate_cap_start = 0.10
+    gate_cap_final = 0.28
+    gate_cap_warmup_steps = 4000
+
+This means the gate starts small and becomes active gradually. The gate is
+never allowed to open without bound.
+
+--------------------------------------------------------------------------------
+7.3 Bounded Global Event Scale
+--------------------------------------------------------------------------------
+
+In addition to the token gate, BRG uses a bounded global event scale:
+
+    s_e = s_max * sigmoid(a),
+
+where a is a learnable scalar parameter.
+
+The final reported model uses approximately:
+
+    event_scale_init = 0.035
+    event_scale_max = 0.12
+
+Thus the event residual is globally limited. Even if a token gate becomes
+active, the event branch remains a correction term.
+
+--------------------------------------------------------------------------------
+7.4 Final BRG Formula
+--------------------------------------------------------------------------------
+
+The final fused token is:
+
+    F_i = R_i + s_e * g_i * g^c_i * Delta Z_i.
+
+In the main model:
+
+    g^c_i = 1,
+
+so the practical main formula is:
+
+    F_i = R_i + s_e * g_i * Delta Z_i.
+
+This formula is the central Method equation for the paper.
+
+--------------------------------------------------------------------------------
+7.5 Why Bounded Residual Fusion Matters
+--------------------------------------------------------------------------------
+
+Without bounded residual fusion, event features can cause several failure modes:
+
+1. MASt3R's pretrained RGB geometry prior can be overwritten.
+2. The model can overfit dataset-specific event density statistics.
+3. Event noise, flicker, and temporal trails can be amplified.
+4. Depth can become blocky, pixel-like, or scale-unstable.
+
+Bounded residual fusion gives a safer inductive bias:
+
+    use RGB as the stable geometric base,
+    use events only as local corrections.
+
+================================================================================
+8. Gate Regularization
+================================================================================
+
+Token-level gates need regularization. Otherwise, the network can learn
+degenerate solutions, such as opening event gates everywhere or saturating gate
+logits.
+
+Night3R uses auxiliary gate losses.
+
+--------------------------------------------------------------------------------
+8.1 Mean Gate Regularization
+--------------------------------------------------------------------------------
+
+This loss prevents the event gate from being globally active:
+
+    L_mean = max(mean_i(g_i) - g_cap_mean, 0)^2.
+
+The final reported model uses approximately:
+
+    gate_mean_cap_start = 0.03
+    gate_mean_cap_final = 0.12
+    gate_mean_cap_warmup_steps = 4000
+    gate_mean_reg_weight = 2e-3
+
+Interpretation:
+
+    Event should be a local supplement, not a full-image replacement.
+
+--------------------------------------------------------------------------------
+8.2 Low-event Gate Regularization
+--------------------------------------------------------------------------------
+
+This loss penalizes opening gates in regions with little event support:
+
+    L_low = mean(g_i^2 | o_i < o_thr).
+
+The final reported model uses approximately:
+
+    low_event_occupancy_thr = 0.01
+    gate_low_event_reg_weight = 4e-2
+
+Interpretation:
+
+    If there is no event evidence, event should not affect the RGB token.
+
+This directly fixes the scalar-g limitation. A scalar gate cannot turn itself
+off in empty local regions, but BRG can.
+
+--------------------------------------------------------------------------------
+8.3 Gate Logit Regularization
+--------------------------------------------------------------------------------
+
+This loss discourages logit saturation:
+
+    L_logit = mean(max(|l_i| - l_bound, 0)^2).
+
+The final reported model uses approximately:
+
+    logit_reg_bound = 3.4
+    gate_logit_reg_weight = 3e-4
+
+Interpretation:
+
+    Gates should remain adjustable and interpretable rather than becoming hard,
+    saturated switches too early.
+
+--------------------------------------------------------------------------------
+8.4 Optional Channel Deviation Regularization
+--------------------------------------------------------------------------------
+
+The code supports optional channel modulation:
+
+    g^c_i = 1 + alpha * tanh(MLP([R_i, Z_i, r_i])).
+
+If enabled, channel modulation is regularized with:
+
+    L_channel = mean((g^c_i - 1)^2).
+
+However, the final reported model disables channel modulation:
+
+    use_channel_modulation = false.
+
+Therefore the main Method should not present strong channel modulation as a
+core contribution.
+
+--------------------------------------------------------------------------------
+8.5 Total Gate Regularization
+--------------------------------------------------------------------------------
+
+The total auxiliary regularization can be written as:
+
+    L_gate =
+        lambda_mean  * L_mean
+      + lambda_low   * L_low
+      + lambda_logit * L_logit
+      + lambda_chan  * L_channel.
+
+For the final reported model, the main active terms are mean gate, low-event gate,
+and logit regularization.
+
+These losses make the gate:
+
+1. sparse,
+2. reliability-aware,
+3. non-saturating,
+4. preserving of the pretrained RGB backbone.
+
+================================================================================
+9. Optional Visibility and Structural Gates
+================================================================================
+
+The code also supports RGB visibility gates and structural event gates. These
+are useful for ablations or future work but should not be over-emphasized as the
+main contribution.
+
+RGB visibility confidence estimates whether the RGB token is locally reliable
+using exposure, contrast, gradient visibility, and high-frequency artifact cues:
+
+    v_i in [0,1].
+
+The intuition is:
+
+    if RGB is reliable, event can be used less;
+    if RGB is dark or textureless, event can be used more.
+
+The structural gate estimates whether event density and occupancy provide
+coherent structure and suppresses extreme hotspot-like responses.
+
+However, the main paper story should remain:
+
+    direct event tokenization,
+    reliability statistics,
+    bounded residual fusion,
+    gate regularization.
+
+Visibility-aware temporal support and VATS-style dynamic bins should be
+reported, if needed, as ablation or negative/future-work results. The current
+main model uses a fixed 8-channel event voxel.
+
+================================================================================
+10. Training Objective
+================================================================================
+
+Night3R is trained as an event-augmented student with a frozen or mostly frozen
+RGB teacher. The objective is not a single depth loss. It combines weak teacher
+consistency, event structure cues, supervised depth where available, and gate
+regularization.
+
+The total loss is:
+
+    L =
+        lambda_f * L_feat
+      + lambda_s * L_struct
+      + lambda_e * L_event_edge
+      + lambda_d * L_depth
+      + L_gate.
+
+For the paper explanation, we can describe the training recipe with the
+previous multi-source configuration, because the loss design and optimization
+strategy are essentially the same:
+
+    feat_distill          = 0.06
+    structure_consistency = 0.06
+    event_depth_edge      = 0.10
+    depth_gt              = 1.0
+    depth_gradient_gt     = 0.06
+    event_photo           = 0.006
+    pose_gt               = 0.0
+
+These are base weights. The actual effective weight is source-aware. MVSEC and
+DSEC carry the main depth/event-edge supervision in this recipe, while DL3DV is
+used as a low-light generalization and photometric stress source without
+supervised metric depth. For the final reported model, the most important
+practical point is that real MVSEC nighttime samples calibrate the event branch
+to the target low-light distribution. This is an experimental configuration
+detail, not a separate method component: the architecture and loss design remain
+the BRG-based Night3R recipe described here.
+
+--------------------------------------------------------------------------------
+10.1 Feature Distillation Loss
+--------------------------------------------------------------------------------
+
+Feature distillation keeps the event-augmented student close to the frozen RGB
+teacher in feature space:
+
+    L_feat = mean_i(1 - cos(norm(f^S_i), norm(f^T_i))).
+
+Here f^S_i is the Night3R student feature and f^T_i is the frozen MASt3R/Dark3R
+teacher feature.
+
+This loss serves three purposes:
+
+1. preserve the pretrained RGB feature distribution,
+2. prevent early event training from destabilizing the token space,
+3. encourage event to act as a supplement rather than a new backbone.
+
+--------------------------------------------------------------------------------
+10.2 Structure Consistency Loss
+--------------------------------------------------------------------------------
+
+Structure consistency keeps the student 3D output close to the teacher's
+high-confidence geometry:
+
+    P^S_i, P^T_i in R^3.
+
+For valid and high-confidence teacher points:
+
+    L_struct =
+        mean_i log(1 + |(P^S_i - P^T_i) / scale|).
+
+The scale is computed robustly from the teacher point distribution, typically
+using a median point norm with clamping. This is not a ground-truth supervision
+term. It is a consistency target that discourages the event branch from
+destroying MASt3R's geometry prior.
+
+The log1p form reduces the influence of severe outliers and makes the loss
+more stable.
+
+--------------------------------------------------------------------------------
+10.3 Event-depth Edge Loss
+--------------------------------------------------------------------------------
+
+Event activity often occurs near image motion boundaries and geometric
+discontinuities. Night3R uses a weak event-depth edge consistency loss.
+
+First compute event activity:
+
+    A = sum_c |E_c|.
+
+Then compute predicted depth gradient:
+
+    G = |partial_x D| + |partial_y D|.
+
+Both A and G are z-normalized over valid pixels. The loss encourages positive
+correlation:
+
+    corr = mean(znorm(A) * znorm(G)),
+
+    L_event_edge = 1 - clamp(corr, -1, 1).
+
+This does not force every event to correspond to a depth edge. It only gives a
+weak structural cue that event-active regions should often align with local
+geometry changes.
+
+--------------------------------------------------------------------------------
+10.4 Supervised Depth Loss
+--------------------------------------------------------------------------------
+
+Where ground-truth depth is available, Night3R uses supervised depth:
+
+    L_depth = SILog(D_pred, D_gt).
+
+This term calibrates metric depth scale and improves raw absolute metrics such
+as raw AbsRel. The method should clearly state that true depth_gt is used where
+available; pseudo depth should not be presented as ground-truth supervision.
+
+Depth-gradient supervision is also used in the training recipe:
+
+    L_depth_grad =
+        mean_valid |partial_x log D_pred - partial_x log D_gt|
+      + mean_valid |partial_y log D_pred - partial_y log D_gt|.
+
+The implementation can emphasize RGB and event edge regions through an edge
+weight map. In the final recipe:
+
+    depth_gradient_gt = 0.06
+    depth_gradient_gt_source_weights:
+        mvsec: 0.7
+        dsec: 0.5
+        dl3dv: 0.0
+        default: 0.0
+    depth_gradient_image_edge_weight = 0.5
+    depth_gradient_event_edge_weight = 1.0
+    depth_gradient_log_depth = true
+
+This term is different from event-depth edge correlation. The event-depth edge
+loss only weakly correlates predicted depth discontinuities with event activity.
+The depth-gradient GT loss uses real depth_gt gradients where available and
+therefore provides a stronger local geometry constraint on MVSEC and DSEC.
+
+--------------------------------------------------------------------------------
+10.5 Event Photometric Consistency
+--------------------------------------------------------------------------------
+
+The code supports an event photometric consistency loss. It warps the second
+image to the first using predicted depth and camera pose, then compares log
+intensity changes with polarity-summed event deltas.
+
+In the training recipe, this term is enabled only as a weak source-aware
+stabilizer:
+
+    event_photo = 0.006
+    event_photo_source_weights:
+        mvsec: 0.4
+        dsec: 0.0
+        dl3dv: 1.0
+        default: 0.0
+
+Thus the effective photometric weight is small on MVSEC, disabled on DSEC, and
+active on DL3DV. It should be described as an auxiliary stabilization term, not
+as the main geometry supervision. The main geometry signal remains teacher
+structure consistency, real depth where available, event-depth edge alignment,
+and BRG gate regularization.
+
+Reason for keeping it weak:
+
+    The loss is sensitive to pose accuracy, exposure, event/RGB temporal
+    alignment, and event preprocessing. It is useful as an auxiliary term,
+    especially for DL3DV-style stress cases, but it should not be overclaimed
+    as the core contribution.
+
+--------------------------------------------------------------------------------
+10.6 Dynamic Source-aware Loss Weighting
+--------------------------------------------------------------------------------
+
+This detail is important for Night3R because the training data is heterogeneous.
+MVSEC, DSEC, DL3DV-style samples do not always provide the same supervision.
+Some batches have metric depth, some have events but no reliable depth, and some
+losses are intentionally disabled for a source. Therefore the implementation
+does not use a fixed static sum of all configured losses for every batch.
+
+Instead, each optional loss has a base weight and may also have source-specific
+scales. For a loss term k and dataset source s:
+
+    lambda_k_eff(s) = lambda_k_base * alpha_k(s).
+
+The training recipe uses source-aware scales such as:
+
+    event_depth_edge_source_weights:
+        mvsec: 1.0
+        dsec: 1.0
+        dl3dv: 0.0
+        default: 1.0
+
+    depth_gt_source_weights:
+        mvsec: 1.0
+        dsec: 0.35
+        dl3dv: 0.0
+        default: 1.0
+
+    depth_gradient_gt_source_weights:
+        mvsec: 0.7
+        dsec: 0.5
+        dl3dv: 0.0
+        default: 0.0
+
+    event_photo_source_weights:
+        mvsec: 0.4
+        dsec: 0.0
+        dl3dv: 1.0
+        default: 0.0
+
+This means that the same training script can mix sources while selectively
+enabling supervision only where it is meaningful. For example, metric depth
+supervision is applied to sources with usable depth_gt. DSEC contributes depth
+with a smaller scale and event-depth edge supervision. DL3DV contributes no
+supervised metric depth in this repository, but can still contribute teacher
+consistency and the weak event photometric stabilizer where relative pose is
+available.
+
+In code, the source scale is resolved per batch from batch["dataset_source"].
+If a batch contains mixed sources, the implementation uses the mean scale of the
+sources in that batch and logs the chosen scale. This is a pragmatic dynamic
+loss policy for multi-source training: the active objective changes with the
+available supervision and the dataset source.
+
+It is important not to overclaim this as a learned dynamic loss weighting method
+such as uncertainty weighting, GradNorm, or DWA. The current implementation is a
+source-aware dynamic effective-weight system controlled by the training config.
+
+--------------------------------------------------------------------------------
+10.7 Active-loss Normalization
+--------------------------------------------------------------------------------
+
+After resolving source-specific effective weights, the code only counts loss
+terms that are actually active and not skipped. The active weight is:
+
+    W_active = sum_{k in A} lambda_k_eff,
+
+where A is the set of loss components that are enabled and successfully computed
+for the current batch. The unnormalized total is:
+
+    L_sum = sum_{k in A} lambda_k_eff L_k + L_gate.
+
+The training code then normalizes the total loss by active loss weights:
+
+    L_final = L_sum / active_weight * target_weight.
+
+This prevents total loss scale from changing abruptly when a batch skips a loss
+because a required field such as depth_gt or relative_pose is unavailable.
+
+The main configuration uses:
+
+    normalize_by_active_weight = true
+    loss_normalize_target_weight = 1.0
+    loss_normalize_min_weight = 1e-6
+    max_total_loss = 100.0
+
+Thus, if a batch has depth supervision, W_active includes the effective depth
+weight. If a batch has no valid depth target or the source-specific depth scale
+is zero, that term is removed from both L_sum and W_active. This keeps the
+gradient magnitude comparable across batches with different supervision sets.
+
+BRG auxiliary gate losses also participate in this accounting. The fusion module
+returns an auxiliary total and a weight_sum. If the auxiliary weight_sum is
+positive, it is added to W_active. This keeps gate regularization from silently
+changing the global loss scale when enabled or disabled.
+
+This dynamic loss handling is a practical training detail, but it is central for
+stable Night3R training because the method combines teacher distillation,
+geometry consistency, event structure cues, optional depth supervision, and gate
+regularization across datasets with different annotation availability.
+
+================================================================================
+11. Conservative Adapter-style Training
+================================================================================
+
+The most stable current recipe trains Night3R conservatively as an adapter.
+
+Main idea:
+
+    preserve MASt3R's RGB geometry prior,
+    train event encoder and fusion adapter slowly,
+    avoid catastrophic forgetting.
+
+For the final reported model, the effective setting can be described as:
+
+    freeze_teacher = true
+    trainable_rgb_blocks = 0
+    lr_event_encoder = 5e-6
+    lr_fusion_adapter = 7e-6
+    lr_dark3r = 0
+    lr_head = 0
+    amp = true
+    amp_dtype = bf16
+    batch_size = 1
+    gradient_checkpointing = true
+    grad_clip_norm = 1.0
+    warmup_steps = 400
+    warmup_start_factor = 0.05
+    num_epochs = 2
+
+The previous multi-source configuration remains a good way to describe the
+training machinery, because it contains the same BRG module, source-aware loss
+weights, active-loss normalization, BF16 training, gradient checkpointing, and
+conservative learning rates. The result that matters for the final report is
+that the event branch sees real MVSEC nighttime data. This calibrates the gate
+and event residual to realistic night driving conditions rather than only
+synthetic low-light statistics.
+
+The useful part is that the event encoder and BRG gate learn what real nighttime
+event evidence looks like: where event activity indicates stable structure,
+where it is sparse, and where it should be suppressed. This should be described
+as part of the experimental setup and training data choice, not as a separate
+architectural module.
+
+This means the RGB backbone and heads are frozen, and only the event side and
+fusion adapter are adapted. This is important for the paper narrative:
+
+    Night3R is not trying to relearn MASt3R.
+    It preserves MASt3R and learns when/how to add events.
+
+Suggested paper sentence:
+
+    We intentionally train Night3R as a residual adapter rather than a fully
+    retrained multimodal backbone. This preserves the pretrained MASt3R
+    geometry prior and restricts event information to local,
+    reliability-gated corrections.
+
+================================================================================
+12. Inference Procedure
+================================================================================
+
+At inference time, Night3R receives:
+
+    RGB pair: (I_1, I_2)
+    event voxel pair: (E_1, E_2)
+
+For each view:
+
+1. Encode RGB image using the MASt3R RGB encoder.
+2. Encode event voxel using the event token encoder.
+3. Compute token-level event reliability statistics.
+4. Generate the bounded reliability gate.
+5. Add the gated event residual to the RGB token.
+6. Decode fused tokens using the original MASt3R decoder and heads.
+
+The output remains:
+
+    pred1["pts3d"],
+    pred2["pts3d_in_other_view"],
+    confidence maps,
+    descriptor-related outputs if available.
+
+This is important because it allows direct comparison with MASt3R and keeps
+downstream evaluation scripts mostly unchanged.
+
+================================================================================
+13. Why Night3R Is Better Than RGB-only MASt3R in Low Light
+================================================================================
+
+MASt3R is a strong RGB-only pairwise 3D reconstruction model. In normal
+lighting, its pretrained visual prior is powerful. But in low-light scenes,
+RGB observations may lose precisely the local cues needed for geometry:
+texture, edges, and reliable contrast.
+
+Night3R adds event information, but in a controlled way.
+
+Its advantages are:
+
+1. Event branch provides local motion-edge and structure cues.
+2. Reliability statistics estimate where events are trustworthy.
+3. Token-wise gates allow local use of events instead of global event injection.
+4. Bounded residual fusion protects the RGB backbone.
+5. Gate regularization prevents full-image event domination.
+6. Teacher consistency preserves pretrained geometry.
+7. Supervised depth, where available, improves metric scale.
+
+The safest paper statement is:
+
+    Compared with RGB-only MASt3R, Night3R introduces reliability-aware event
+    residuals that recover low-light structures while preserving MASt3R's
+    pretrained geometric prior.
+
+Avoid saying:
+
+    Event replaces RGB.
+
+Better:
+
+    Event complements RGB through local bounded residual corrections.
+
+================================================================================
+14. Metrics and Evaluation Language
+================================================================================
+
+For depth metrics, distinguish raw and median-aligned metrics.
+
+Raw metrics compare predicted depth directly to ground truth:
+
+    AbsRel_raw = mean(|D_pred - D_gt| / D_gt).
+
+Raw metrics evaluate metric scale and absolute depth accuracy.
+
+Median-aligned metrics first rescale prediction:
+
+    s = median(D_gt) / median(D_pred),
+    D'_pred = s * D_pred.
+
+Then AbsRel, delta1, RMSE log, or PSNR are computed. Median-aligned metrics
+evaluate relative geometry after removing global scale error.
+
+Recommended reporting:
+
+1. Raw AbsRel as the primary metric for metric depth.
+2. Median-aligned AbsRel as a secondary metric for relative structure.
+3. If both improve, the method improves both scale and geometry.
+4. If only median-aligned improves, the method improves structure but not scale.
+
+For DL3DV in this repository, there is no depth_gt. DL3DV should be described
+as a stress/qualitative or low-light consistency split using depth distribution
+statistics and warp consistency, not as a main supervised depth benchmark.
+
+================================================================================
+15. Required Ablations for Method Claims
+================================================================================
+
+The Method section makes several claims. Each claim should map to an ablation.
+
+--------------------------------------------------------------------------------
+15.1 Event Contribution
+--------------------------------------------------------------------------------
+
+Compare:
+
+    real event,
+    zero event,
+    shuffled event.
+
+Expected interpretation:
+
+    real > zero shows event input contributes useful information.
+    real > shuffle shows the model uses spatially aligned events, not just event
+    count statistics.
+
+--------------------------------------------------------------------------------
+15.2 Reliability Statistics
+--------------------------------------------------------------------------------
+
+Compare:
+
+    full statistics: density + occupancy + polarity balance,
+    density only,
+    density + occupancy,
+    no statistics or learned constant gate.
+
+Expected interpretation:
+
+    full statistics should produce more stable gates, especially in sparse or
+    noisy event regions.
+
+--------------------------------------------------------------------------------
+15.3 Bounded Residual Fusion
+--------------------------------------------------------------------------------
+
+Compare:
+
+    scalar global gate,
+    unbounded residual,
+    bounded residual BRG.
+
+Expected interpretation:
+
+    bounded residual should reduce scale drift, blocky depth, and event-induced
+    degradation.
+
+--------------------------------------------------------------------------------
+15.4 Gate Regularization
+--------------------------------------------------------------------------------
+
+Compare:
+
+    full gate regularization,
+    no mean gate regularization,
+    no low-event regularization,
+    no logit regularization.
+
+Expected interpretation:
+
+    full regularization should keep gate sparse, avoid low-event regions, and
+    prevent saturation.
+
+================================================================================
+16. Contributions for Paper
+================================================================================
+
+Recommended contribution wording:
+
+Contribution 1: Direct event-token encoding for MASt3R-style reconstruction.
+
+    We encode event voxels directly into MASt3R-compatible tokens, avoiding
+    event-to-image reconstruction and preserving the original pairwise 3D output
+    interface.
+
+Contribution 2: Token-level event reliability statistics.
+
+    We compute local density, occupancy, and polarity-balance statistics to
+    estimate where event evidence is useful or unreliable.
+
+Contribution 3: Bounded Reliability Gate.
+
+    We propose a reliability-aware bounded residual fusion module that injects
+    event features as local corrections to pretrained RGB tokens.
+
+Contribution 4: Gate regularization for stable event fusion.
+
+    We regularize mean gate usage, low-event gate activation, and gate logit
+    saturation to prevent event overuse and preserve the RGB geometry prior.
+
+Contribution 5: Low-light RGB-event evaluation protocol.
+
+    We evaluate under real night data, synthetic darkening, event corruption
+    controls, and both raw and median-aligned depth metrics.
+
+================================================================================
+17. Suggested Method Section Structure for Overleaf
+================================================================================
+
+Recommended subsection order:
+
+    3.1 Overview
+    3.2 Event Voxelization and Event Token Encoder
+    3.3 Event Reliability Statistics
+    3.4 Bounded Reliability Gate
+    3.5 Training Objectives
+    3.6 Training and Inference Details
+
+Do not put all losses before the fusion module. The paper should first explain
+the core modeling contribution, then describe training.
+
+Recommended main equations:
+
+Equation 1: Event voxel temporal binning.
+
+Equation 2: Event reliability vector:
+
+    r_i = [d_i, o_i, b_i].
+
+Equation 3: Event residual:
+
+    Delta Z_i = P(LN(Z_i)).
+
+Equation 4: Gate:
+
+    g_i = c(t) sigmoid(L tanh(l_i/L) / tau) * 1[o_i > epsilon].
+
+Equation 5: BRG fusion:
+
+    F_i = R_i + s_e g_i Delta Z_i.
+
+Equation 6: Training objective:
+
+    L_sum =
+        lambda_f L_feat
+      + lambda_s L_struct
+      + lambda_e L_event_edge
+      + lambda_d L_depth
+      + lambda_g L_depth_grad
+      + lambda_p L_event_photo
+      + L_gate.
+
+Equation 7: Dynamic active-loss normalization:
+
+    lambda_k_eff(s) = lambda_k_base * alpha_k(s),
+
+    W_active = sum_{k in A} lambda_k_eff,
+
+    L_final = target_weight * L_sum / max(W_active, epsilon).
+
+================================================================================
+18. Polished English Draft Paragraphs
+================================================================================
+
+The following paragraphs can be adapted directly into Overleaf.
+
+--------------------------------------------------------------------------------
+18.1 Overview Paragraph
+--------------------------------------------------------------------------------
+
+We build Night3R on top of a pretrained MASt3R-style pairwise reconstruction
+backbone. The model keeps the original RGB reconstruction path and augments it
+with an event-token branch. Given an RGB pair and corresponding event voxels,
+the RGB images are encoded into MASt3R image tokens, while the event voxels are
+directly patchified and encoded into tokens with the same spatial grid and
+feature dimension. Night3R then injects event information through a
+reliability-aware bounded residual adapter before the MASt3R decoder. The
+decoder and output heads remain unchanged, preserving compatibility with the
+original MASt3R outputs.
+
+--------------------------------------------------------------------------------
+18.2 Event Token Paragraph
+--------------------------------------------------------------------------------
+
+Unlike approaches that first reconstruct intensity images from events, Night3R
+uses events directly. We discretize each event window into a polarity-separated
+temporal voxel with four bins for positive events and four bins for negative
+events. The voxel is normalized over non-zero entries to preserve sparsity.
+The event voxel is then patchified with the same patch size as the MASt3R image
+encoder and processed by an event encoder copied from the MASt3R token
+architecture. This produces event tokens aligned with RGB tokens in both token
+grid and feature dimension.
+
+--------------------------------------------------------------------------------
+18.3 Reliability Paragraph
+--------------------------------------------------------------------------------
+
+Event measurements are spatially sparse and not uniformly reliable. Therefore,
+Night3R computes token-level reliability statistics from the raw event voxel.
+For each token region, we compute log event density, spatial occupancy, and
+polarity balance. Density measures local event activity, occupancy measures
+whether the activity is spatially supported, and polarity balance captures
+extreme positive/negative imbalance that may indicate artifacts. These
+statistics are normalized and used to generate a local reliability gate.
+
+--------------------------------------------------------------------------------
+18.4 BRG Paragraph
+--------------------------------------------------------------------------------
+
+Our Bounded Reliability Gate treats events as residual corrections rather than
+replacement features. For each token, the event token is projected into a
+residual direction and multiplied by a token-level reliability gate and a
+bounded global event scale. The fused token is the original RGB token plus this
+bounded event residual. This design preserves the pretrained RGB token
+distribution of MASt3R while allowing events to recover low-light structures in
+locally reliable regions.
+
+--------------------------------------------------------------------------------
+18.5 Training Paragraph
+--------------------------------------------------------------------------------
+
+We train Night3R conservatively around a frozen RGB-only MASt3R teacher. The
+teacher provides feature and structure consistency targets, while supervised
+depth and depth-gradient losses are used only where real depth annotations are
+available. An event-depth edge loss encourages predicted depth discontinuities
+to correlate with event activity, and a weak event photometric term can be used
+as a source-aware auxiliary stabilizer. The gate is regularized to avoid
+full-image event usage, suppress low-event regions, and prevent logit
+saturation. The RGB backbone and heads are kept frozen, so the event encoder and
+BRG module learn to provide local event corrections without relearning MASt3R.
+
+In the final reported setting, real MVSEC nighttime samples are important because
+they calibrate the event branch to the target low-light distribution. The model
+learns when events are reliable at night, not merely how to consume synthetic
+event-like features. Source-aware dynamic effective loss weights and active-loss
+normalization keep the same training recipe stable when different sources expose
+different valid supervision terms.
+
+================================================================================
+19. Things Not to Overclaim
+================================================================================
+
+Do not overclaim the following as main contributions:
+
+1. VATS or dynamic temporal bins.
+   Current evidence suggests this is not the strongest main method.
+
+2. Event photometric loss.
+   It is a weak source-aware auxiliary term, not the main geometry supervision
+   or the core method contribution.
+
+3. Strong channel modulation.
+   It is implemented but disabled in the final reported model.
+
+4. DL3DV supervised metric depth.
+   DL3DV in this repository does not have depth_gt. Use it as stress,
+   qualitative, or warp-consistency evaluation.
+
+5. Full scene global alignment.
+   Current method is pairwise MASt3R-style prediction. Keep global alignment
+   separate if discussed.
+
+================================================================================
+20. 中文方法总结
+================================================================================
+
+Night3R 的核心不是简单把 event 和 RGB concat，也不是先把 event 重建成图像再送进 MASt3R。我们保留 MASt3R 原来的 RGB 几何主干，让 RGB token 仍然作为主路径，然后把 event voxel 直接编码成和 MASt3R 对齐的 token，再用一个可靠性控制的 residual 注入到 RGB token 里面。这样做的好处是，MASt3R 原本很强的几何先验不会被破坏，event 只负责在夜间低光区域补充 RGB 看不清的局部结构。
+
+event 的输入是 4 个 temporal bins、正负极性分开的 8-channel voxel。它不是走 E2VID 这类 event-to-image 路线，而是直接通过 patch embedding 变成 token，然后经过一份和 MASt3R encoder 结构一致的 event encoder。这样 event token 和 RGB token 在 token grid、feature dimension、空间位置上都是对齐的。后面融合时，每个 RGB patch 都能拿到同位置的 event token，不需要先生成一张伪图像，也避免了 event reconstruction 带来的纹理幻觉。
+
+BRG 是现在最关键的模块。以前那种 scalar gate 只有一个全局 event 强度，问题很明显：如果 gate 小，event 基本没用；如果 gate 大，event 会全图污染 RGB feature。夜间场景里 event 的可靠性是局部的，有些区域有真实边缘和运动结构，有些地方是空的、噪声、flicker 或者过曝区域，所以不能用一个全局 gate。BRG 把 event 当成 residual correction，而不是 replacement feature。
+
+具体来说，event encoder 先产生 event token E_i，然后通过 LayerNorm 和一个 MLP 得到 event residual direction：
+
+    Delta E_i = MLP(LN(E_i)).
+
+这个 Delta E_i 表示 event 分支认为当前 token 应该往哪个方向修正 RGB token。它不是最终直接加上去的，因为 event 并不总是可靠。BRG 还会对每个 token 计算 event reliability statistics，包括 event density、occupancy 和 polarity balance。density 表示这个 patch 里 event 活动强不强，occupancy 表示这个 patch 里是不是真的有 event 支撑，polarity balance 用来判断正负极性是否异常偏置。然后用这些统计量生成 token-level gate：
+
+    g_i = reliability_gate(density_i, occupancy_i, polarity_balance_i).
+
+最终融合是：
+
+    F_i = R_i + s_event * g_i * Delta E_i.
+
+这里 R_i 是原始 MASt3R RGB token，F_i 是融合后的 token。s_event 是全局有界 scale，g_i 是局部 gate。这个公式的含义很清楚：RGB 仍然是主体，event 只能在可靠区域以有界 residual 的形式补充。没有 event 的 patch，occupancy 会把 gate 压掉；event 很乱的区域，gate 和正则也会限制它乱开。
+
+这个设计比普通 RGB-event cross-attention 更稳。cross-attention 的表达能力更强，但也更容易让 event token 大范围重写 RGB token，尤其是在夜间 event 噪声、hot pixel、反光和运动拖影比较多的时候。我们的逻辑是先保证 MASt3R 的 token distribution 不被破坏，再让 event 做局部修正。也就是说，Delta E 负责“event 想改什么”，g_i 和 s_event 负责“允许它改多少”。
+
+训练上，我们不是让整个 MASt3R 重新学一遍。teacher 是 frozen RGB-only MASt3R，student 是 RGB+event Night3R。训练时用 feature distillation 和 structure consistency 把 student 拉在 MASt3R 原有几何空间附近，避免 event 分支一开始就把 geometry 搞乱。真实 depth 可用的时候，用 depth loss 和 depth-gradient loss 校准 metric scale 和局部几何边界；event-depth edge loss 则让 event 活动区域和预测 depth discontinuity 更一致。BRG 自己还有 gate regularization，限制全图开 gate、低 event 区域开 gate 和 gate logit 饱和。
+
+实验配置上，真实 MVSEC 夜间样本很关键。它让 event branch 看到真实夜间驾驶里的 event 分布，而不是只依赖 synthetic darkening 或者跨域事件统计。真实夜间 event 的密度、稀疏性、极性分布和噪声模式都和普通白天/合成低光不一样。经过这一步以后，BRG 学到的不是“只要有 event 就加”，而是“哪些夜间 event 真的能补 RGB 的结构，哪些 event 应该被压掉”。这部分应该作为实验设置和数据选择来讲，不需要写成额外的方法模块。
+
+MASt3R 本身已经有很强的 pairwise 3D prior，在大多数区域 RGB token 仍然可靠；Night3R 不去替换它，而是在低光、弱纹理、运动模糊、RGB 结构不稳定的区域让 event 以小 residual 的方式补充。这样既保留了 MASt3R 的整体几何稳定性，又能利用 event 在夜间边缘和运动结构上的优势。
+
+所以整套方法可以概括成一句话：
+
+    Night3R keeps MASt3R as the geometric backbone and uses events as bounded,
+    reliability-gated residual corrections in the token space.
+
+中文就是：我们不是重新做一个 event 版 MASt3R，而是在 MASt3R token 空间里加了一个可靠性控制的 event residual adapter。event 只在可靠的局部区域补结构，不全图接管 RGB。这个设计解释性强、训练稳定，也方便和具体实验配置对应起来。
+
+实验配置可以直接描述为：最终汇报模型使用 MASt3R ViT-Large metric checkpoint 作为 RGB backbone，RGB teacher 保持 frozen，student 是 RGB+event Night3R。输入分辨率是 512 x 512，event 表示为 4 个 temporal bins、正负极性分开的 8-channel voxel。event voxel 经过 log-count compression 和 non-zero normalization 后进入 event token encoder。event token encoder 的 patch size 与 MASt3R token grid 对齐，输出 token 维度也与 MASt3R RGB token 一致。
+
+训练配置说明可以沿用之前的配置写法，因为主要模块和训练机制一致：BRG 开启，Density-FiLM 关闭，channel modulation 关闭，source bias 和 source-stat normalization 开启，gate regularization 开启。BRG 的关键超参数可以写成：
+
+    fusion_type = brg
+    event_scale_init ~= 0.035
+    event_scale_max ~= 0.12
+    gate_bias_init ~= -3.6
+    gate_logit_bound ~= 5.0
+    gate_cap_start ~= 0.10
+    gate_cap_final ~= 0.28
+    gate_mean_cap_start ~= 0.03
+    gate_mean_cap_final ~= 0.12
+    low_event_occupancy_thr = 0.01
+
+如果不想在正文里写太多具体数值，可以只保留 event_scale、gate_cap 和 gate_mean_cap 这三个约束，因为它们最能说明 BRG 的 bounded residual 设计。event_scale 限制 event residual 的整体幅度，gate_cap 限制单个 token 的最大注入量，gate_mean_cap 限制整张图平均使用 event 的程度。
+
+loss 配置可以按多源训练 recipe 来讲：feature distillation 和 structure consistency 用来保持 MASt3R 几何先验；depth_gt 和 depth_gradient_gt 在有真实深度的样本上校准 metric scale 和局部深度边界；event_depth_edge 让 event activity 和 predicted depth edge 保持弱一致；event_photo 只是弱辅助项，不作为核心监督。动态 loss 部分要说清楚：不同数据源可用监督不一样，所以每个 loss 有 source-aware effective weight，只把当前 batch 真正有效的 loss 计入 active loss，然后用 active weight 做 normalization，避免某些 batch 因为缺 depth 或禁用某个 loss 导致 loss 尺度突变。
+
+训练设置可以写成保守 adapter-style training：RGB backbone 和 head 不更新，只训练 event encoder 和 fusion adapter；batch size 为 1；使用 BF16 AMP、gradient checkpointing、gradient clipping；学习率保持很小。这样写的重点不是强调训练技巧，而是说明我们的目标不是重新训练 MASt3R，而是在不破坏 MASt3R token distribution 的情况下，让 event branch 学会提供可靠的局部 residual。
+
+最终汇报 checkpoint 使用：
+
+    /data/fcr/data/Night3R/outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+训练配置参考：
+
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+这里可以这样解释：配置文件代表了我们方法里的完整训练机制，包括 BRG、source-aware loss、active-loss normalization、BF16、checkpointing 和 conservative adapter-style training；最终汇报模型则是在真实 MVSEC 夜间样本上得到更贴近目标低光分布的 event reliability 行为。论文里重点写方法机制和实验设置，不需要展开和某个具体 baseline 的因果解释。
+
+================================================================================
+21. Key Files
+================================================================================
+
+Reference training config for method description:
+
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+Final reported checkpoint:
+
+    /data/fcr/data/Night3R/outputs/night3r_mvsec_only_adapt_1k_from_best/last_event_dark3r.pth
+
+Event voxel:
+
+    /data/fcr/data/Night3R/dataset/event_voxel.py
+
+Event token encoder:
+
+    /data/fcr/data/Night3R/model/event_encoder.py
+
+BRG fusion:
+
+    /data/fcr/data/Night3R/model/event_fusion.py
+
+Event student wrapper:
+
+    /data/fcr/data/Night3R/model/event_dark3r_student.py
+
+Training entry:
+
+    /data/fcr/data/Night3R/train_event_dark3r.py
+
+DL3DV low-light protocol from the reference multi-source run:
+
+    /data/fcr/data/Night3R/outputs/night3r_event_reliability_dsec_holdout_v1_4gpu_mast3r_retrain8k/eval_after_train/dl3dv_lowlight_protocol_v2/summary.md
+
+DL3DV MASt3R-gap stress split:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_mast3r_gap_test_v1

@@ -1,0 +1,354 @@
+Night3R 当前框架技术说明
+==========================
+
+1. 任务定义与整体数据流
+----------------------
+
+Night3R 面向低照度双视图三维重建。对一个样本，输入包含两个时间相邻或
+几何相关的低照度 RGB 图像，以及分别与两张图像在空间和时间上对应的事件
+体素张量。记两个输入视角为 v=1,2：
+
+  I_dark = {I_1^dark, I_2^dark}
+  V      = {V_1, V_2}
+
+模型输出沿用 MASt3R/Dark3R 的双视图接口：每个视角对应的稠密三维点图、
+点图置信度、局部匹配描述子及其置信度。两个视角的三维点图遵循原有的
+共同坐标系约定，即都表达在第一视角的坐标系中。
+
+整个前向过程可概括为：
+
+  低照度 RGB 对 -> RGB encoder -> RGB tokens
+  事件 voxel 对  -> event patch/token encoder -> event tokens
+  RGB tokens + event tokens + token-level event statistics -> BRG residual fusion
+  两个融合后的 token 序列 -> 原始 cross-view decoder -> 点图和匹配输出
+
+事件只用于对 RGB token 做受限的残差校正；RGB 分支始终是主几何路径。
+因此，当事件为空、缺失，或某个 token 没有事件活动时，模型自然退化为
+原始 RGB 重建路径，而不会用事件结果替换 RGB 表示。
+
+
+2. RGB 输入与低照度样本构成
+-----------------------------
+
+训练数据加载器会首先读取同一场景中的一对 RGB 图像，并将它们统一到网络
+使用的空间分辨率。图像保留两套形式：
+
+  (1) 参考 RGB：用于教师分支和需要参考观测的监督；
+  (2) 低照度 RGB：用于学生分支。
+
+对于可进行合成低照度退化的参考图像，退化在近似线性的亮度域中完成：
+
+  I_linear = I_srgb ^ gamma
+  I_dark_linear = exposure * I_linear + shot noise + read noise
+  I_dark = clamp(I_dark_linear) ^ (1 / gamma)
+
+这样，曝光衰减和信号相关噪声在近似相机线性响应域中发生，而不是直接在
+sRGB 显示域简单乘暗。对于本身已经是夜间采集的样本，低照度图也可以直接
+使用原图，不再重复施加合成退化。
+
+事件体素与两张图分别对应。加载器不会在读取事件 voxel 后再对它执行 RGB
+暗化操作；事件本身是独立的亮度变化测量。需要合成事件的训练数据，在离线
+数据构建阶段生成图像序列和事件，再将对齐的 voxel 写入样本目录。
+
+
+3. 事件表示：frame-like polarity-separated voxel
+--------------------------------------------------
+
+每个视角的事件输入是一个 frame-like 多通道张量：
+
+  V_v in R^(8 x H x W)
+
+它由四个时间 bin 和正负极性分离组成，通道布局为：
+
+  [positive-bin-0, positive-bin-1, positive-bin-2, positive-bin-3,
+   negative-bin-0, negative-bin-1, negative-bin-2, negative-bin-3]
+
+对原始事件 e_k=(x_k,y_k,t_k,p_k)，先保留图像边界内的事件；时间位置映射
+到四个离散 bin 所覆盖的连续坐标，再将一次事件以线性插值分配到相邻两个
+时间 bin。正、负事件累积到各自的通道中。因此，事件张量既保留 polarity，
+也保留粗粒度时间顺序，同时保持与图像相同的二维像素网格。
+
+当前常规数据路径直接加载离线保存的 events/*.pt 张量。若输入是原始事件
+列表，框架也提供运行时 voxel 构建逻辑，得到相同的通道语义。加载后若其
+空间尺寸与网络图像尺寸不同，事件 tensor 与 RGB 一样被调整到统一空间
+尺寸，以维持 pixel-to-pixel 对齐关系。
+
+在送入 event encoder 前，当前框架还会进行事件幅值整理：
+
+  V_norm = sign(V) * log(1 + |V|)
+
+随后仅在非零位置上进行逐样本标准化。log 压缩降低极高事件计数或热点对
+event encoder 的支配；非零标准化则缓解不同样本的全局事件率差异。零位置
+保持为零，因此“无事件”的空间位置不会被归一化操作伪造出活动。
+
+
+4. Event patch embedding 与 event token encoder
+------------------------------------------------
+
+事件不是先被重建为灰度图或伪 RGB 图，而是直接作为八通道 frame-like voxel
+进入事件分支。第一层是 patch-strided convolution：
+
+  Z_0^E = LayerNorm(Flatten(Conv_patch(V_norm)))
+
+其中 Conv_patch 的 kernel size 和 stride 都等于 RGB backbone 使用的 patch
+size。若输入图像大小为 H x W，patch size 为 p，则 event token 网格为：
+
+  H_t = H / p,  W_t = W / p,  N = H_t * W_t.
+
+因此，第 i 个 event token 与第 i 个 RGB patch token 覆盖同一个空间区域。
+patch convolution 后的 token 维度与 RGB encoder token 维度一致。每个 event
+token 还使用同样规则生成二维位置索引 (row, column)。
+
+随后，事件 token 通过与 RGB encoder 同构的 ViT encoder blocks 和最终归一化
+层，得到：
+
+  Z^E = Phi_E(V_norm),   Z^E in R^(N x d).
+
+这里需要区分两件事：
+
+  - 事件分支复用 RGB 分支的 transformer 拓扑、token 尺寸和空间 token 网格；
+  - event patch embedding 本身是八通道输入映射，不是把 RGB 三通道 patch
+    embedding 直接复制成八通道。
+
+这使事件 token 可以在不经过图像重建中间步骤的情况下进入与 RGB token
+兼容的表示空间。
+
+
+5. RGB token 与事件统计的并行构建
+------------------------------------
+
+两个低照度 RGB 图像首先经过原始 RGB image encoder：
+
+  Z_v^I = Phi_I(I_v^dark),  v in {1,2}.
+
+两个 event voxel 则各自经过上述 event encoder：
+
+  Z_v^E = Phi_E(V_v_norm).
+
+BRG 使用的可靠性统计并不直接从归一化后的 event token 推断，而是从进入
+event encoder 前的原始 voxel 幅值计算，以避免归一化后丢失事件活跃程度。
+对每个像素先定义：
+
+  A(x,y) = sum_c |V(c,x,y)|.
+
+再构造三个图像尺度统计图：
+
+  density(x,y)          = log(1 + A(x,y))
+  occupancy(x,y)        = 1[A(x,y) > 0]
+  polarity_balance(x,y) = |A_plus(x,y)-A_minus(x,y)| /
+                           (A_plus(x,y)+A_minus(x,y)+epsilon).
+
+其中 A_plus 与 A_minus 分别由正、负极性通道求和得到。三个统计图经 adaptive
+average pooling 降到 event token 网格，得到每个 token 的：
+
+  r_i = [density_i, occupancy_i, polarity_balance_i].
+
+所以 BRG 的输入统计既包含事件总量，也包含覆盖区域大小和正负极性是否严重
+失衡。事件密度高不自动等价于可信：很小区域内的热点、单一极性闪烁或大面积
+稀疏活动，都会在这三个量的组合中表现出不同模式。
+
+对于混合来源训练，框架可根据样本来源标识对 r_i 使用来源相关的标准化和
+偏置项。这样做的目的不是改变 token 对齐，而是减少不同传感器、不同事件
+窗口和不同数据构建方式带来的事件率分布差异。
+
+
+6. BRG：Bounded Reliability Gate 残差融合
+--------------------------------------------
+
+当前 Night3R 的 event-RGB 融合不是 event-to-RGB cross-attention。它是一次
+发生在 RGB encoder 输出和 cross-view decoder 输入之间的、token 对齐的受限
+残差融合。
+
+6.1 事件残差内容
+
+event token 首先经过 LayerNorm 和一个轻量投影网络：
+
+  Delta Z_i^E = phi_r(LayerNorm(Z_i^E)).
+
+phi_r 是逐 token 的两层非线性投影。它决定“如果注入事件，注入什么特征”。
+Delta Z_i^E 来自 event token 的内容表示，而不是来自 RGB-event attention
+输出，也不是由三维几何输出反推得到。
+
+6.2 Token-wise reliability gate
+
+三个统计量 r_i 经过来源校准后进入一个小型 gate network：
+
+  l_i = phi_g(Norm_source(r_i)) + beta_source.
+
+为防止极端统计量导致饱和，logit 先被平滑限制：
+
+  l_bar_i = L * tanh(l_i / L).
+
+随后得到 token 级门控：
+
+  g_i = cap(u) * sigmoid(l_bar_i / temperature) * 1[occupancy_i > 0].
+
+其中 cap(u) 是训练过程中的渐进上限。occupancy 掩码具有明确的功能：若一个
+patch 内没有事件，则 g_i 严格为零。也就是说，空事件输入不会凭借 gate
+network 生成任意事件修正。
+
+6.3 全局受限尺度与融合公式
+
+除 token-wise gate 外，BRG 还维护一个全局受限尺度 s_e。最终融合为：
+
+  Z_tilde_i^I = Z_i^I + s_e * g_i * Delta Z_i^E.
+
+当前默认关闭逐通道调制，因此每个 token 使用一个标量 gate，而不是让事件
+分支任意重写 RGB token 的每个通道。这个设计有三个直接后果：
+
+  1. RGB token 是残差融合的基底，事件不会替换 RGB 表示；
+  2. 事件注入强度同时受全局尺度、token gate 和空事件掩码约束；
+  3. 事件稀疏、失配或无效时，RGB 主路径仍然保留。
+
+BRG 内部还记录 gate mean、gate range、低事件区域 gate、logit 范围和事件
+残差相对 token 范数等诊断信息。这些量可用于检查事件分支是否被完全关闭、
+是否出现大面积激活，或是否在无事件区域产生异常响应。
+
+6.4 与旧 Gate Cross-Attention 的关系
+
+工程中保留了 gated cross-attention、concat-MLP、additive 和 tensor gate 等
+融合实现，用于对比实验。当前主框架选用 BRG residual fusion：
+
+  - 不执行 event token 对 RGB token 的 attention map；
+  - 不从 cross-attention 输出直接产生 Delta Z^E；
+  - 不在多个 decoder layer 重复注入 event feature；
+  - 只在 encoder token 层完成一次 event residual 注入。
+
+MASt3R 原有的 cross-view decoder 仍然保留 view-to-view cross-attention，用于
+两个视角之间的几何交互。这里的 cross-attention 属于原始双视图几何 decoder，
+不等同于 event-RGB fusion。
+
+
+7. Cross-view decoding 与输出
+------------------------------
+
+对于两个视角，BRG 分别得到：
+
+  Z_tilde_1^I = BRG(Z_1^I, Z_1^E, r_1)
+  Z_tilde_2^I = BRG(Z_2^I, Z_2^E, r_2).
+
+这两个融合 token 连同各自的位置编码进入原始 cross-view decoder。decoder 在
+这里建立 view 1 与 view 2 的对应关系，并将局部外观、视差和跨视角约束转化为
+几何表示。后续 prediction heads 输出：
+
+  - 第一视角像素对应的点图；
+  - 第二视角像素对应的点图，并表达在第一视角坐标系；
+  - 每个点图位置的置信度；
+  - 局部匹配描述子和描述子置信度。
+
+事件分支没有独立的三维输出 head。它通过改变 cross-view decoder 的输入 token，
+间接改善低照度下的跨视图对应与几何预测。
+
+
+8. 训练期 teacher-student 流程
+------------------------------
+
+训练时，参考 RGB 对与低照度 RGB-event 对同时存在：
+
+  teacher input: clear / well-exposed RGB pair
+  student input: darkened RGB pair + aligned event voxel pair
+
+teacher 仅在训练期提供目标几何；student 执行完整的 RGB-event 前向。两者对应
+同一对相机视角，因此输出点图遵循相同坐标约定，可直接进行像素级比较。
+
+当前简化后的训练信号包括：
+
+8.1 点图蒸馏
+
+当存在参考 RGB 对时，教师产生点图和置信度。仅保留教师高置信度位置，用鲁棒
+点图误差约束 student 的三维点图。两个视角共同使用稳健场景尺度做归一化，
+并使用 Huber 形式降低异常教师点的影响。
+
+8.2 度量深度监督
+
+当样本带有有效深度和相机标定时，将 student 点图转换到对应相机坐标系以获得
+深度。然后在有效深度像素上使用对数深度残差构造 scale-aware 深度约束。没有
+深度标注的来源不会强行计算这项监督。
+
+8.3 Gate regularization
+
+BRG 额外约束以下行为：
+
+  - 限制整体 gate 响应，避免事件在所有位置持续注入；
+  - 抑制低 occupancy token 的 gate；
+  - 抑制 logit 长期处于饱和区间。
+
+这不是让 gate 拟合人工可靠性标签，而是让模型在训练中维持可检查、稀疏且
+受限的事件校正行为。
+
+8.4 动态可用性聚合
+
+不同数据来源提供的参考 RGB、深度和相机信息并不完全相同。训练时，每个
+mini-batch 只启用其前提满足的监督项，并在激活项之间做动态归一化。这样，
+某个标注缺失不会令该 batch 的总训练尺度突然变化，也不需要为缺失标注伪造
+监督信号。
+
+
+9. 分阶段训练逻辑
+------------------
+
+框架采用逐步扩大适配范围的策略，三个阶段的输入模态和前向结构相同，区别
+在于允许适配的模块范围不同：
+
+  阶段一：先让 event patch entry 和 BRG 学习如何以保守方式接入 RGB token；
+  阶段二：让完整 event encoder 与 cross-view decoder 协同适应融合 token；
+  阶段三：只对 RGB encoder 的末端高层表示做小范围协同调整，以改善跨模态
+          表示衔接，同时避免广泛改变 RGB 几何主路径。
+
+无论处于哪一阶段，teacher 都接收参考 RGB，student 都接收低照度 RGB 与
+对应 event voxel。阶段变化不改变事件表示、BRG 公式或输出接口。
+
+
+10. 推理流程
+-------------
+
+推理时只保留 student：
+
+  输入：低照度 RGB pair + 对齐 event voxel pair
+  输出：双视图点图、置信度、局部描述子和描述子置信度
+
+不需要参考 RGB、教师输出、深度标注或相机位姿标注。事件为空时，空事件 token
+对应的 occupancy 为零，BRG 不注入事件残差，模型回退为 RGB 主路径。
+
+
+11. 关键实现边界与论文表述约束
+---------------------------------
+
+为保证方法描述与当前实现一致，建议坚持下列说法：
+
+  - 事件表示是 polarity-separated temporal voxel，不是 event image reconstruction；
+  - event patch embedding 是八通道 patch-strided convolution，不是 RGB patch
+    embedding 的直接通道复制；
+  - event encoder 与 RGB encoder 拥有相同 token 网格和 transformer 拓扑；
+  - Delta event 来自 event token 的轻量残差投影；
+  - BRG 的 token gate 由 event density、occupancy 和 polarity balance 引导；
+  - 当前 event-RGB fusion 是一次 token-level residual fusion，不是 event-RGB
+    cross-attention；
+  - cross-attention 出现在后续原始 cross-view decoder 的双视图几何交互中；
+  - 事件通过受限残差修正 RGB，而不是替换 RGB；
+  - teacher 只在训练期间使用，推理只使用低照度 RGB 和事件。
+
+不应将当前主框架描述为多层 decoder 注入、event-to-RGB attention 融合，或由
+RGB-event cross-attention 直接生成事件残差。这些表述与当前 BRG 实现不一致。
+
+
+12. 可解释性与建议记录的诊断量
+--------------------------------
+
+每个样本都可以从模型输出中提取下列事件诊断：
+
+  - token gate map；
+  - gate 的均值、方差、最小值和最大值；
+  - event density、occupancy、polarity balance 的 token 统计；
+  - event residual 与 RGB token 范数的相对比例；
+  - 空事件区域与活跃事件区域的平均 gate；
+  - 每个视角的 event token shape。
+
+这些诊断能够直接支持三类验证：
+
+  (1) real event、zero event、shuffle event 对比；
+  (2) 事件密度与 gate 响应是否符合预期；
+  (3) 事件分支是否在无事件或稀疏事件区域保持关闭。
+
+它们应作为方法调试和消融解释的证据，而不是替代几何精度、深度精度或重建
+一致性评估。

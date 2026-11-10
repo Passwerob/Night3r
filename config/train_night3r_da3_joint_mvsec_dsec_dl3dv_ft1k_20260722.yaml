@@ -1,0 +1,99 @@
+_base_: train_night3r_dl3dv_da3_pseudo_ft1k_20260722.yaml
+
+# Re-start from the pre-DA3 universal checkpoint and jointly rehearse the two
+# real-depth sources while learning held-out DL3DV shape from DA3 pseudo depth.
+dataset:
+  root:
+    - "/data/fcr/data/train_data/MVSEC"
+    - "/data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train"
+    - "/data/fcr/data/train_data/DL3DV_DA3_pseudo_v1"
+  pair_sampling: "random"
+  min_pair_distance: 1
+  max_pair_distance: 3
+  allow_reverse_pairs: true
+  max_scenes: null
+  max_pairs_per_scene: null
+  num_workers: 4
+
+# MVSEC and DSEC are already night/low-light observations. Synthetic darkening
+# is applied only to clean DL3DV RGB paired with the DA3 teacher prediction.
+lowlight_aug:
+  enabled: true
+  apply_sources: ["dl3dv"]
+  min_exposure: 0.004
+  max_exposure: 0.05
+  read_noise_std: 1.0e-5
+  shot_noise: true
+  shot_noise_std: 5.0e-5
+  gamma_space_input: true
+
+loss:
+  dark3r_original: 0.0
+  descriptor_distill: 0.0
+  feat_distill: 0.0
+  structure_consistency: 0.0
+  event_depth_edge: 0.0
+  event_photo: 0.0
+  depth_gradient_gt: 0.0
+  pose_gt: 0.0
+  pose_cycle: 0.0
+
+  # Metric depth anchors scale on both real event-camera datasets.
+  depth_gt: 1.0
+  depth_gt_source_weights:
+    mvsec: 1.0
+    dsec: 1.0
+    dl3dv: 0.0
+    default: 0.0
+
+  # DA3 remains a confidence-masked, scale-aligned shape teacher for DL3DV.
+  pseudo_depth: 0.25
+  pseudo_depth_source_weights:
+    mvsec: 0.0
+    dsec: 0.0
+    dl3dv: 1.0
+    default: 0.0
+  pseudo_depth_confidence_percentile: 40.0
+  pseudo_depth_huber_delta: 0.1
+  pseudo_depth_min_valid_fraction: 0.05
+
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 100.0
+
+training:
+  stage: 0
+  num_epochs: 2
+  batch_size: 1
+  symmetric_pairs: false
+  balanced_dataset_sampling: true
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: true
+  grad_clip_norm: 1.0
+  save_every_epoch: false
+  save_every_steps: 200
+  warmup_steps: 100
+  warmup_start_factor: 0.05
+  lr_event_encoder: 5.0e-7
+  lr_fusion_adapter: 1.0e-6
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  stages:
+    - name: "da3_joint_mvsec_dsec_dl3dv_ft1k_stage0"
+      stage: 0
+      num_epochs: 2
+      partial_finetune_blocks: 0
+      warmup_steps: 100
+      warmup_start_factor: 0.05
+      lr_event_encoder: 5.0e-7
+      lr_fusion_adapter: 1.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0
+
+eval:
+  every_epochs: 0
+  batch_size: 1
+  num_workers: 0
+  max_batches: 32

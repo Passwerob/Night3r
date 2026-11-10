@@ -1,0 +1,11 @@
+_base_: train_night3r_global_final_continue_200_20260723.yaml
+
+lowlight_aug:
+  enabled: true
+  apply_sources: ["dsec", "mvsec"]
+  min_exposure: 0.05
+  max_exposure: 0.05
+  read_noise_std: 0.01
+  shot_noise: true
+  shot_noise_std: 0.01
+  gamma_space_input: true

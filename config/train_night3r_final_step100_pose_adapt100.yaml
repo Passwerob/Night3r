@@ -1,0 +1,27 @@
+_base_: train_night3r_pose_separate_branches_w5_dense2k.yaml
+
+# Adapt only the existing pose head to the final step-100 geometry features.
+# The inherited data split excludes every MVSEC/DL3DV paper-test scene.
+training:
+  pose_head_only: true
+  checkpoint_mode: "pose_head_only"
+  batch_size: 2
+  warmup_steps: 10
+  warmup_start_factor: 0.2
+  lr_event_encoder: 0.0
+  lr_fusion_adapter: 0.0
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  lr_pose_head: 1.0e-4
+  save_every_steps: 50
+  stages:
+    - name: "final_step100_pose_adapt"
+      stage: 0
+      partial_finetune_blocks: 0
+      warmup_steps: 10
+      warmup_start_factor: 0.2
+      lr_event_encoder: 0.0
+      lr_fusion_adapter: 0.0
+      lr_dark3r: 0.0
+      lr_head: 0.0
+      lr_pose_head: 1.0e-4

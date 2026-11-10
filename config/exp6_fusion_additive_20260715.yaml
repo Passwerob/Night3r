@@ -1,0 +1,8 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Conventional same-grid event projection followed by residual addition.
+fusion:
+  fusion_type: "additive_projection"
+  use_density_film: false
+  event_scale_init: 0.035
+

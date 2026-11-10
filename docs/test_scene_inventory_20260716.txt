@@ -1,0 +1,263 @@
+Night3R test-scene inventory
+Audit date: 2026-07-16
+
+This document separates current paper evaluation roots, auxiliary stress-test
+roots, and archived roots.  A directory named "test" is not automatically a
+strict held-out test set; scene overlap with the checkpoint's training root is
+reported explicitly below.
+
+
+1. Current DSEC test root
+=========================
+
+Root:
+    /data/fcr/data/train_data/DSEC_test
+
+Split policy:
+    Scene-level holdout.  DSEC training uses screen-000001-dsec and
+    screen-000002-dsec; the current test root contains only screen-000003-dsec.
+
+Scenes:
+    screen-000003-dsec    sequence=zurich_city_02_b    frames=613
+
+Full adjacent-pair protocol:
+    612 pairs, fixed stride 1.
+
+Table 7 protocol actually used:
+    Only the first 128 of the 612 adjacent pairs.
+
+Training overlap for the reported final checkpoint:
+    No DSEC scene overlap with the official DSEC training split.
+
+
+2. Current MVSEC test root
+==========================
+
+Root:
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test
+
+Scenes (49 frames and 48 adjacent pairs per scene):
+    screen-000123-mvsec
+    screen-000157-mvsec
+    screen-000200-mvsec
+    screen-000205-mvsec
+    screen-000207-mvsec
+    screen-000220-mvsec
+
+Full adjacent-pair protocol:
+    288 pairs across all six scenes, fixed stride 1.
+
+Table 7 protocol actually used:
+    128 pairs total:
+      screen-000123-mvsec: 48 pairs
+      screen-000157-mvsec: 48 pairs
+      screen-000200-mvsec: 32 pairs
+    The remaining 16 pairs from screen-000200 and every pair from
+    screen-000205, screen-000207, and screen-000220 were not evaluated.
+
+Training overlap for the reported final checkpoint:
+    All six scenes are symlinks into /data/fcr/data/train_data/MVSEC.
+    The final MVSEC-only 1k checkpoint was trained with
+    resolved_data_root=/data/fcr/data/train_data/MVSEC (11,074 candidate
+    samples).  Therefore this current MVSEC root is not a strict scene-held-out
+    test set for that checkpoint.  It is an adaptation-domain evaluation
+    subset and must not be described as an unseen MVSEC test split.
+
+
+3. Primary DL3DV evaluation pool
+================================
+
+Root:
+    /data/fcr/data/eval_data/DL3DV
+
+Scenes (40):
+    screen-000083
+    screen-000084
+    screen-000085
+    screen-000086
+    screen-000087
+    screen-000088
+    screen-000089
+    screen-000090
+    screen-000091
+    screen-000092
+    screen-000093
+    screen-000094
+    screen-000095
+    screen-000096
+    screen-000097
+    screen-000098
+    screen-000099
+    screen-000101
+    screen-000108
+    screen-000110
+    screen-000111
+    screen-000112
+    screen-000113
+    screen-000114
+    screen-000115
+    screen-000116
+    screen-000117
+    screen-000118
+    screen-000119
+    screen-000120
+    screen-000121
+    screen-000122
+    screen-000123
+    screen-000124
+    screen-000125
+    screen-000126
+    screen-000127
+    screen-000128
+    screen-000129
+    screen-000130
+
+Training overlap:
+    No scene-name overlap with /data/fcr/data/train_data/DL3DV.
+
+Table 7 protocol actually used:
+    None of these DL3DV scenes appears in Table 7.
+
+
+4. Auxiliary test and stress roots
+==================================
+
+4.1 MVSEC hard subset
+
+Root:
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test_hard
+
+Scenes (6):
+    screen-000115-mvsec
+    screen-000129-mvsec
+    screen-000144-mvsec
+    screen-000170-mvsec
+    screen-000208-mvsec
+    screen-000226-mvsec
+
+Status:
+    Auxiliary hard subset.  All six scenes also belong to the full MVSEC root
+    used by the final 1k checkpoint, so this is not scene-held-out.
+
+
+4.2 DL3DV cloudy subset
+
+Root:
+    /data/fcr/data/eval_data/DL3DV_cloudy_test
+
+Scenes (1):
+    screen-000124
+
+Status:
+    Symlinked subset of the primary DL3DV evaluation pool.
+
+
+4.3 DL3DV hard-test v1
+
+Manifest:
+    outputs/splits/night3r_dl3dv_hard_test_v1/selection_manifest.json
+
+Selected scene/pair entries (12):
+    screen-000083    pair=24-31
+    screen-000123    pair=24-31
+    screen-000097    pair=24-31
+    screen-000098    pair=24-31
+    screen-000099    pair=24-31
+    screen-000108    pair=24-31
+    screen-000085    pair=24-31
+    screen-000088    pair=24-31
+    screen-000096    pair=24-31
+    screen-000084    pair=24-31
+    screen-000092    pair=24-31
+    screen-000101    pair=24-31
+
+Status:
+    Hardness-selected stress subset of the primary DL3DV evaluation pool.
+
+
+4.4 DL3DV MASt3R-gap test v1
+
+Manifest:
+    outputs/splits/night3r_dl3dv_mast3r_gap_test_v1/selection_manifest.json
+
+Selected entries (6):
+    screen-000088    pair=24-25    exposure=0.20
+    screen-000120    pair=24-25    exposure=0.20
+    screen-000130    pair=24-25    exposure=0.20
+    screen-000125    pair=24-25    exposure=0.20
+    screen-000108    pair=24-25    exposure=0.20
+    screen-000090    pair=24-25    exposure=0.10
+
+Status:
+    Method-gap-selected diagnostic subset.  It is useful for failure analysis
+    but should not be treated as an unbiased primary benchmark.
+
+
+4.5 Single-scene MVSEC debug roots
+
+Roots/scenes:
+    /data/fcr/data/eval_data/MVSEC_scene_020    screen-000020-mvsec
+    /data/fcr/data/eval_data/MVSEC_scene_050    screen-000050-mvsec
+    /data/fcr/data/eval_data/MVSEC_scene_095    screen-000095-mvsec
+    /data/fcr/data/eval_data/MVSEC_scene_110    screen-000110-mvsec
+
+Status:
+    Debug roots, not primary paper test splits.  They also point into the full
+    MVSEC root used by the final 1k checkpoint.
+
+
+5. Archived test roots
+======================
+
+5.1 Previous MVSEC 8-scene root
+
+Root:
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test_prev_8scene_20260701
+
+Scenes (8):
+    screen-000122-mvsec
+    screen-000123-mvsec
+    screen-000156-mvsec
+    screen-000157-mvsec
+    screen-000200-mvsec
+    screen-000205-mvsec
+    screen-000207-mvsec
+    screen-000220-mvsec
+
+Status:
+    Archived protocol.  All eight overlap the full MVSEC root used by the
+    final 1k checkpoint.
+
+
+5.2 Previous DSEC 2-scene root
+
+Root:
+    /data/fcr/data/Night3R/outputs/eval_roots/dsec_test_prev_2scene_20260701
+
+Scenes (2):
+    screen-000002-dsec
+    screen-000003-dsec
+
+Status:
+    Archived protocol.  screen-000002-dsec belongs to the DSEC training split;
+    only screen-000003-dsec is held out.
+
+
+6. Table 7 audit conclusion
+===========================
+
+Table 7 did load data through the current DSEC_test and
+MVSEC_outdoor_night2_test filesystem roots.  The CLI --data-root correctly
+overrode the training root stored in the evaluation config, and all compared
+methods used identical ordered sample IDs.
+
+However, Table 7 is not an all-test-scene evaluation:
+
+    1. DSEC uses 128/612 available test pairs.
+    2. MVSEC uses 128/288 available pairs and only partially covers 3/6 scenes.
+    3. The six current MVSEC scenes overlap the full MVSEC root used by the
+       final MVSEC-only 1k checkpoint.
+    4. The 40-scene DL3DV evaluation pool is absent from Table 7.
+
+Therefore the existing Table 7 should be described as a fixed-subset darken
+evaluation, not as a full strictly held-out multi-dataset test benchmark.

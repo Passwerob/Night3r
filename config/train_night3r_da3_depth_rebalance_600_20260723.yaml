@@ -1,0 +1,30 @@
+_base_: train_night3r_da3_depth_repair_shape_800_20260723.yaml
+
+# Continue from the DL3DV-improved shape checkpoint with stronger DSEC replay
+# and half the adapter learning rate to recover real-depth transfer.
+loss:
+  pseudo_depth_metric_scale_weight: 0.0
+
+training:
+  num_epochs: 4
+  save_every_steps: 100
+  warmup_steps: 30
+  warmup_start_factor: 0.1
+  lr_event_encoder: 5.0e-7
+  lr_fusion_adapter: 1.0e-6
+  source_sampling_weights:
+    dl3dv: 3
+    dsec: 2
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "da3_depth_rebalance_600_stage0"
+      stage: 0
+      num_epochs: 4
+      partial_finetune_blocks: 0
+      warmup_steps: 30
+      warmup_start_factor: 0.1
+      lr_event_encoder: 5.0e-7
+      lr_fusion_adapter: 1.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0

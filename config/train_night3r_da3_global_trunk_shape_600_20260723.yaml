@@ -1,0 +1,18 @@
+_base_: train_night3r_da3_global_sweep_common_20260723.yaml
+
+loss:
+  pseudo_depth_metric_scale_weight: 0.0
+
+training:
+  stages:
+    - name: "da3_global_trunk_shape_600_stage5"
+      stage: 5
+      num_epochs: 4
+      partial_finetune_blocks: 24
+      warmup_steps: 50
+      warmup_start_factor: 0.05
+      lr_event_encoder: 2.5e-7
+      lr_fusion_adapter: 5.0e-7
+      lr_dark3r: 5.0e-8
+      lr_head: 0.0
+

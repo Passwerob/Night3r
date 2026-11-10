@@ -1,0 +1,7 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Apply exposure and noise directly to the gamma-compressed input instead of
+# inverse-gamma -> linear darkening -> gamma encoding.
+lowlight_aug:
+  gamma_space_input: false
+

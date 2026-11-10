@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Night3R Pair Review</title>
+  <link rel="stylesheet" href="styles.css?v=4">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <span class="brand-mark">N3R</span>
+        <div>
+          <h1>Pair Review</h1>
+          <span id="connectionState" class="connection">Connecting</span>
+        </div>
+      </div>
+
+      <div class="active-pair">
+        <div class="pair-tags">
+          <span id="datasetBadge" class="dataset-badge">DSEC</span>
+          <span id="splitBadge" class="split-badge">strict-heldout</span>
+        </div>
+        <h2 id="pairTitle">Loading candidates</h2>
+        <p id="pairPosition">0 of 0</p>
+      </div>
+
+      <div class="progress-block">
+        <div class="progress-labels">
+          <strong id="reviewProgress">0 / 244 reviewed</strong>
+          <span id="reviewCounts">0 kept / 0 skipped</span>
+        </div>
+        <div class="progress-track"><span id="progressFill"></span></div>
+      </div>
+
+      <div class="header-actions">
+        <button id="undoButton" class="icon-command" type="button" title="Undo last decision (U)" aria-label="Undo last decision">
+          <span aria-hidden="true">&#8630;</span><kbd>U</kbd>
+        </button>
+        <button id="fullscreenButton" class="icon-command" type="button" title="Toggle viewer fullscreen (F)" aria-label="Toggle viewer fullscreen">
+          <span aria-hidden="true">&#x26F6;</span><kbd>F</kbd>
+        </button>
+      </div>
+    </header>
+
+    <aside class="queue-panel" aria-label="Candidate queue">
+      <div class="queue-controls">
+        <div class="control-label">Dataset</div>
+        <div class="segmented stretch" id="datasetFilter" aria-label="Dataset filter">
+          <button class="active" data-value="all" type="button">All</button>
+          <button data-value="DSEC" type="button">DSEC</button>
+          <button data-value="MVSEC" type="button">MVSEC</button>
+          <button data-value="DL3DV" type="button">DL3DV</button>
+        </div>
+
+        <div class="control-label">Status</div>
+        <div class="segmented stretch" id="statusFilter" aria-label="Review status filter">
+          <button class="active" data-value="all" type="button">All</button>
+          <button data-value="unreviewed" type="button">Open</button>
+          <button data-value="keep" type="button">Keep</button>
+          <button data-value="skip" type="button">Skip</button>
+        </div>
+
+        <label class="search-field">
+          <span aria-hidden="true">&#8981;</span>
+          <input id="searchInput" type="search" placeholder="Scene or pair" autocomplete="off">
+        </label>
+        <select id="sortSelect" aria-label="Sort candidates">
+          <option value="sequence">Scene order</option>
+          <option value="score_desc">Score high to low</option>
+          <option value="score_asc">Score low to high</option>
+          <option value="noise_asc">Lowest noise</option>
+          <option value="dark_asc">Darkest first</option>
+        </select>
+      </div>
+
+      <div class="queue-heading">
+        <strong>Candidates</strong>
+        <span id="queueSummary">0 shown</span>
+      </div>
+      <div id="candidateList" class="candidate-list"></div>
+    </aside>
+
+    <main class="viewer" id="viewer">
+      <div class="viewer-toolbar">
+        <button id="previousButton" class="nav-button" type="button" title="Previous pair (Left arrow)" aria-label="Previous pair">&#8592;</button>
+        <div class="mode-controls">
+          <div class="segmented" id="viewMode" aria-label="Visualization mode">
+            <button class="active" data-value="review" type="button">All 8 <kbd>1</kbd></button>
+            <button data-value="pair" type="button">Inputs <kbd>2</kbd></button>
+            <button data-value="depth" type="button">Depth <kbd>3</kbd></button>
+            <button data-value="geometry" type="button">3D <kbd>4</kbd></button>
+            <button data-value="overview" type="button">Sheet <kbd>5</kbd></button>
+          </div>
+          <div class="segmented geometry-view-control" id="geometryView" aria-label="3D camera view">
+            <button class="active" data-value="elevated" type="button">Elevated</button>
+            <button data-value="front" type="button">Front</button>
+          </div>
+        </div>
+        <button id="nextButton" class="nav-button" type="button" title="Next pair (Right arrow or J)" aria-label="Next pair">&#8594;</button>
+      </div>
+
+      <div id="visualStage" class="visual-stage" aria-live="polite"></div>
+      <div id="loadingState" class="loading-state">Loading visual assets</div>
+    </main>
+
+    <aside class="inspector">
+      <div class="inspector-scroll">
+        <section class="decision-summary">
+          <div>
+            <span class="section-label">Current decision</span>
+            <strong id="decisionValue">Unreviewed</strong>
+          </div>
+          <span id="scoreValue" class="score-value">Score 0.000</span>
+        </section>
+
+        <section class="metric-section">
+          <div class="section-heading">
+            <span class="section-label">Depth metrics</span>
+          </div>
+          <div id="metricTable" class="metric-table"></div>
+        </section>
+
+        <section class="detail-section">
+          <span class="section-label">Input diagnostics</span>
+          <dl id="diagnosticList"></dl>
+        </section>
+
+        <section class="detail-section protocol-section">
+          <span class="section-label">3D comparison protocol</span>
+          <dl id="protocolList"></dl>
+        </section>
+
+        <label class="note-field">
+          <span class="section-label">Selection note</span>
+          <textarea id="noteInput" rows="3" placeholder="Figure role, crop, or concern"></textarea>
+        </label>
+
+        <div id="warningBox" class="warning-box" hidden></div>
+      </div>
+
+      <div class="decision-dock">
+        <button id="skipButton" class="decision-button skip" type="button">
+          <span class="decision-icon" aria-hidden="true">&#215;</span>
+          <span>Skip</span><kbd>X</kbd>
+        </button>
+        <button id="clearButton" class="clear-button" type="button" title="Clear current decision">Clear</button>
+        <button id="keepButton" class="decision-button keep" type="button">
+          <span class="decision-icon" aria-hidden="true">&#10003;</span>
+          <span>Keep</span><kbd>K</kbd>
+        </button>
+      </div>
+    </aside>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js?v=5"></script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+_base_: train_night3r_global_final_continue_200_20260723.yaml
+
+# Continue from the selected Night3R step-100 checkpoint. The new DL3DV
+# chunk replaces the already-seen pseudo-depth subset for this short run,
+# while MVSEC and DSEC remain replay anchors against domain regression.
+dataset:
+  root:
+    - "/data/fcr/data/train_data/MVSEC"
+    - "/data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train"
+    - "/data/fcr/data/train_data/DL3DV_DA3_pseudo_chunk016"
+
+training:
+  num_epochs: 2
+  save_every_steps: 50
+  save_optimizer_state: false
+  warmup_steps: 20
+  warmup_start_factor: 0.1
+  source_sampling_weights:
+    dl3dv: 4
+    dsec: 2
+    mvsec: 1
+    default: 0
+  stages:
+    - name: "chunk016_da3_continue_200_stage6"
+      stage: 6
+      num_epochs: 2
+      partial_finetune_blocks: 24
+      warmup_steps: 20
+      warmup_start_factor: 0.1
+      lr_event_encoder: 2.5e-7
+      lr_fusion_adapter: 5.0e-7
+      lr_dark3r: 5.0e-8
+      lr_head: 5.0e-9

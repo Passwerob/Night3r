@@ -1,0 +1,7 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+dataset:
+  root:
+    - "/data/fcr/data/train_data/MVSEC"
+    - "/data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train"
+

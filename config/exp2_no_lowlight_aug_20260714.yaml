@@ -1,0 +1,5 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+lowlight_aug:
+  enabled: false
+

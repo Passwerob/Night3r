@@ -1,0 +1,242 @@
+precision: "bf16"
+
+model:
+  name: "event_dark3r"
+  checkpoint: "/data/fcr/data/Night3R/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+  teacher_checkpoint: null
+  freeze_teacher: true
+  freeze_student_dark3r_stage1: true
+  partial_finetune_blocks: 0
+
+event:
+  enabled: true
+  num_bins: 4
+  polarity_separate: true
+  voxel_channels: 8
+  normalize: true
+  patch_size: null
+  copy_dark3r_encoder: true
+  freeze_copied_encoder: false
+
+event_norm:
+  enabled: true
+  use_log_count: true
+  use_nonzero_norm: true
+  eps: 1.0e-6
+
+event_stat:
+  enabled: true
+  stat_dim: 3
+  include_dt: false
+  eps: 1.0e-6
+
+event_film:
+  enabled: false
+  type: "none"
+  hidden_dim: 128
+  eta_init: 0.0
+  eta_max: 0.1
+
+event_fusion:
+  enabled: true
+  type: "bounded_reliability"
+  inject_layers: "auto"
+  init_gate: 0.001
+  num_heads: 4
+  dropout: 0.0
+
+fusion:
+  fusion_type: "brg"
+  use_density_film: false
+  density_film_type: "none"
+  use_channel_modulation: false
+  use_source_bias: true
+  use_gate_regularization: true
+
+brg:
+  stat_dim: 3
+  num_sources: 3
+  use_source_bias: true
+  use_source_stat_norm: true
+  source_initial_gate_bias: [0.0, 0.0, -0.75]
+
+  event_stat_mean: [0.0, 0.0, 0.0]
+  event_stat_std: [1.0, 1.0, 1.0]
+  event_stat_clip: 5.0
+  event_stat_learnable_affine: true
+
+  # This repair run should preserve the stage2 geometry path. Let the event
+  # branch adapt, but keep its residual small enough that DL3DV far-depth tails
+  # cannot dominate the RGB/MASt3R geometry.
+  event_scale_init: 0.025
+  event_scale_max: 0.08
+  force_event_scale_zero: false
+
+  gate_bias_init: -4.4
+  gate_logit_bound: 5.0
+  gate_temperature: 1.0
+  # No-drop continuation from the current best checkpoint: do not restart with
+  # a much lower gate cap, because that changes the old model before learning.
+  gate_cap_start: 0.18
+  gate_cap_final: 0.18
+  gate_cap_warmup_steps: 6000
+  occupancy_eps: 0.0
+
+  use_channel_modulation: false
+  channel_alpha_start: 0.0
+  channel_alpha_final: 0.0
+  channel_alpha_max: 0.10
+  channel_alpha_warmup_steps: 0
+
+  use_gate_regularization: true
+  gate_mean_cap_start: 0.06
+  gate_mean_cap_final: 0.06
+  gate_mean_cap_warmup_steps: 6000
+  low_event_occupancy_thr: 0.01
+  low_event_density_thr: null
+  logit_reg_bound: 3.2
+  gate_mean_reg_weight: 6.0e-3
+  gate_low_event_reg_weight: 6.0e-2
+  gate_logit_reg_weight: 5.0e-4
+  channel_dev_reg_weight: 1.0e-4
+  visibility_gate:
+    enabled: true
+    # Conservative floor: keep most of the old event path, but damp event
+    # residuals in clearly visible RGB regions.
+    floor: 0.60
+    gamma: 1.25
+    detach: true
+    low_thr: 0.35
+    high_thr: 0.70
+    high_visibility_gate_reg_weight: 2.0e-2
+  structural_gate:
+    enabled: true
+    # Structure-aware V-BRG: keep event residuals only where events have enough
+    # local occupancy/density, while softly suppressing isolated hotspots.
+    floor: 0.35
+    density_low: 0.04
+    density_tau: 0.08
+    occupancy_low: 0.03
+    occupancy_tau: 0.04
+    density_high: 2.50
+    density_high_tau: 1.20
+    detach: true
+    low_thr: 0.35
+    high_thr: 0.70
+
+visibility_gate:
+  enabled: true
+  dark_thr: 0.08
+  sat_thr: 0.95
+  exposure_scale: 0.08
+  contrast_tau: 0.06
+  texture_tau: 0.03
+  artifact_tau: 2.0
+  smooth_kernel: 5
+
+dataset:
+  type: "dsec_event"
+  root:
+    - "/data/fcr/data/train_data/MVSEC"
+    - "/data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train"
+    - "/data/fcr/data/train_data/DL3DV"
+  image_size: [512, 512]
+  pair_stride: 1
+  pair_sampling: "random"
+  min_pair_distance: 1
+  max_pair_distance: 7
+  precomputed_pairs: null
+  allow_reverse_pairs: true
+  max_scenes: null
+  max_pairs_per_scene: null
+  num_workers: 4
+
+lowlight_aug:
+  enabled: true
+  min_exposure: 0.03
+  max_exposure: 1.0
+  read_noise_std: 0.01
+  shot_noise: true
+  gamma_space_input: true
+
+loss:
+  dark3r_original: 0.0
+
+  # Stronger teacher anchoring than the previous recovery run. This is the main
+  # guardrail against DL3DV p98 depth tails.
+  feat_distill: 0.08
+  structure_consistency: 0.08
+  structure_conf_thr: 1.0
+  structure_min_scale: 1.0
+  structure_max_scale: 1000.0
+  structure_max_point_norm: 10000.0
+  structure_max_residual: 50.0
+  structure_min_valid_fraction: 0.01
+
+  event_depth_edge: 0.06
+  event_depth_edge_source_weights:
+    mvsec: 1.0
+    dsec: 0.5
+    dl3dv: 0.0
+    default: 1.0
+
+  # Keep DL3DV photo, but make it weak. The last run showed photo loss can look
+  # fine while DL3DV depth p98 still explodes.
+  event_photo: 0.008
+  event_photo_source_weights:
+    mvsec: 0.5
+    dsec: 0.0
+    dl3dv: 1.0
+    default: 0.0
+
+  depth_gt: 1.0
+  depth_gt_source_weights:
+    mvsec: 1.0
+    dsec: 0.15
+    dl3dv: 0.0
+    default: 1.0
+
+  pose_gt: 0.0
+  pose_cycle: 0.0
+  normalize_by_active_weight: true
+  loss_normalize_target_weight: 1.0
+  loss_normalize_min_weight: 1.0e-6
+  max_total_loss: 100.0
+
+training:
+  # Stage 0 trains the full event encoder + fusion adapter and keeps the
+  # Dark3R RGB backbone, decoder, and heads frozen.
+  stage: 0
+  num_epochs: 1
+  batch_size: 1
+  symmetric_pairs: false
+  balanced_dataset_sampling: false
+  amp: true
+  amp_dtype: "bf16"
+  gradient_checkpointing: true
+  grad_clip_norm: 1.0
+  save_every_epoch: true
+  save_every_epoch_fraction: 0.5
+  warmup_steps: 500
+  warmup_start_factor: 0.05
+  lr_event_encoder: 1.0e-6
+  lr_fusion_adapter: 2.0e-6
+  lr_dark3r: 0.0
+  lr_head: 0.0
+  stages:
+    - name: "brg_dl3dv_stage0_adapter_repair"
+      stage: 0
+      num_epochs: 1
+      partial_finetune_blocks: 0
+      warmup_steps: 500
+      warmup_start_factor: 0.05
+      lr_event_encoder: 1.0e-6
+      lr_fusion_adapter: 2.0e-6
+      lr_dark3r: 0.0
+      lr_head: 0.0
+
+eval:
+  every_epochs: 1
+  batch_size: 1
+  num_workers: 0
+  max_batches: 32

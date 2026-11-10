@@ -1,0 +1,9 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Complete the augmentation 2x2: retain shot/read noise but disable darkening.
+lowlight_aug:
+  min_exposure: 1.0
+  max_exposure: 1.0
+  read_noise_std: 0.01
+  shot_noise: true
+

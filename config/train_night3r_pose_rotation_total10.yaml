@@ -1,0 +1,8 @@
+_base_: train_night3r_pose_head_sweep_5k.yaml
+
+loss:
+  pose_rotation_weight: 1.0
+  pose_rotation_chordal_weight: 9.0
+
+training:
+  save_every_steps: 400

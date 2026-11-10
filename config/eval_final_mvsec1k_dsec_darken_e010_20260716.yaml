@@ -1,0 +1,10 @@
+_base_: train_night3r_mvsec_only_adapt_1k_from_best.yaml
+
+lowlight_aug:
+  enabled: true
+  min_exposure: 0.10
+  max_exposure: 0.10
+  read_noise_std: 0.01
+  shot_noise: true
+  shot_noise_std: 0.01
+  gamma_space_input: true

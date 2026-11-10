@@ -1,0 +1,50 @@
+# This is the configuration used for training. It uses 3 exposures per scene, 7 scenes total 
+
+bc041_traincar:
+  clean_iso_et: iso102400_s1_00015
+  noisy_iso_et: 
+    - iso102400_s1_00100
+    - iso102400_s1_00060
+    - iso102400_s1_00160
+
+bc042_chapel_table:
+  clean_iso_et: iso102400_s1_00025
+  noisy_iso_et: 
+    - iso102400_s1_00160
+    - iso102400_s1_00100
+    - iso102400_s1_00250
+
+bc050_quad:
+  clean_iso_et: iso102400_s1_00200
+  noisy_iso_et: 
+    - iso102400_s1_02000
+    - iso102400_s1_01250
+    - iso102400_s1_03200
+
+bc052_storefront:
+  clean_iso_et: iso102400_s1_00160
+  noisy_iso_et: 
+    - iso102400_s1_02500 
+    - iso102400_s1_01600 
+    - iso102400_s1_04000
+
+bc070_table:
+  clean_iso_et: iso102400_s1_00040
+  noisy_iso_et: 
+    - iso102400_s1_00400 
+    - iso102400_s1_00250 
+    - iso102400_s1_00640
+
+bc080_lamp:
+  clean_iso_et: iso102400_s1_00008
+  noisy_iso_et: 
+    - iso102400_s1_00050
+    - iso102400_s1_00030
+    - iso102400_s1_00080
+
+bc081_bookshelf:
+  clean_iso_et: iso102400_s1_00030
+  noisy_iso_et: 
+    - iso102400_s1_00320
+    - iso102400_s1_00200
+    - iso102400_s1_00500

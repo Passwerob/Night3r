@@ -1,0 +1,8 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Darken directly in gamma-compressed sRGB and remove both noise components.
+lowlight_aug:
+  gamma_space_input: false
+  read_noise_std: 0.0
+  shot_noise: false
+

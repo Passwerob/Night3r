@@ -1,0 +1,1763 @@
+Night3R Data Generation and Event Preparation Notes
+Date: 2026-07-06
+
+This note summarizes how our training/evaluation data is constructed, with
+special focus on the synthetic DL3DV event pipeline based on P-RIFE
+(Practical-RIFE) and DVS-Voltmeter, the real-event packing pipeline for
+MVSEC/DSEC, the parts borrowed from the Dark3R data construction philosophy,
+and how events are extracted, voxelized, and split.
+
+
+0. One-sentence summary
+-----------------------
+
+Night3R converts all sources into one MASt3R/Dark3R-compatible "screen-*"
+format:
+
+    screen-xxxx/
+        images/          RGB frames
+        events/          per-frame event voxels, saved as .pt tensors
+        depth_gt/        optional metric depth, for MVSEC/DSEC
+        cameras.yaml     optional camera intrinsics, for real event datasets
+        transforms.json  optional camera poses/intrinsics, for DL3DV
+        meta/            timestamps, event windows, frame-level records
+        meta.json        source and processing metadata
+
+The training loader does not consume raw event streams directly. It consumes
+precomputed per-frame event voxels and then samples RGB/event pairs from the
+same scene.
+
+
+1. Final dataset roots currently used by Night3R
+------------------------------------------------
+
+Main training-style roots:
+
+    /data/fcr/data/train_data/MVSEC
+    /data/fcr/data/train_data/DSEC
+    /data/fcr/data/train_data/DL3DV
+
+Current local counts found in the workspace:
+
+    MVSEC: 226 screen-* scenes
+    DSEC: 3 screen-* scenes
+    DL3DV: 160 screen-* scenes
+
+Important split roots:
+
+    DSEC train:
+        /data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train
+
+    DSEC test:
+        /data/fcr/data/train_data/DSEC_test
+
+    MVSEC current night test:
+        /data/fcr/data/train_data/MVSEC_outdoor_night2_test
+
+    MVSEC previous 8-scene test backup:
+        /data/fcr/data/train_data/MVSEC_outdoor_night2_test_prev_8scene_20260701
+
+    DL3DV hard stress split:
+        /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_hard_test_v1
+
+    DL3DV MASt3R-gap stress split:
+        /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_mast3r_gap_test_v1
+
+The split roots are mostly symlink roots, not copied datasets. For example,
+the current MVSEC night test root contains six symlinks to selected scenes in
+`/data/fcr/data/train_data/MVSEC`, and the DSEC test root contains one symlink
+to `screen-000003-dsec`.
+
+
+2. Unified Night3R sample format
+--------------------------------
+
+The actual loader is:
+
+    /data/fcr/data/Night3R/dataset/dsec_event_dataset.py
+
+Despite the name, this loader is used for MVSEC, DSEC, and DL3DV after they
+are all converted into the same screen-* layout.
+
+Each loaded pair returns:
+
+    images:
+        shape [2, 3, H, W], normalized to [-1, 1] for MASt3R/Dark3R.
+
+    images_photo:
+        shape [2, 3, H, W], kept in [0, 1] for photometric/event losses.
+
+    images_dark / images_photo_dark:
+        low-light augmented RGB when lowlight augmentation is enabled.
+
+    event_voxel:
+        shape [2, 8, H, W].
+        The first dimension is the two selected frames/views.
+        The channel dimension is 8 = 4 positive-polarity temporal bins
+        plus 4 negative-polarity temporal bins.
+
+    intrinsics:
+        3 x 3 camera matrix when available.
+
+    relative_pose / relative_pose_gt:
+        available when the scene has `meta/poses_selected.npz` or valid
+        `transforms.json`.
+
+    depth_gt, depth_gt1, depth_gt2:
+        available when `depth_gt/*.pt` exists, mainly MVSEC/DSEC.
+
+    dataset_source:
+        inferred from meta.json or scene path: mvsec, dsec, dl3dv, or unknown.
+
+Pair sampling is not tied to event extraction. Events are stored per frame
+first, and then the loader chooses two frame indices:
+
+    fixed:
+        idx2 = idx1 + pair_stride
+
+    random:
+        idx2 is sampled from [idx1 - max_distance, idx1 - min_distance]
+        and/or [idx1 + min_distance, idx1 + max_distance], depending on
+        `allow_reverse_pairs`.
+
+    precomputed:
+        idx2 comes from a pairs JSON.
+
+The main mixed-data config uses random pair sampling with distances 1 to 7:
+
+    pair_sampling: random
+    min_pair_distance: 1
+    max_pair_distance: 7
+    allow_reverse_pairs: true
+
+Reference config:
+
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+
+3. Event voxel representation
+-----------------------------
+
+Night3R uses an 8-channel event voxel per frame:
+
+    C = 2 * num_bins = 8
+    num_bins = 4
+    channel order = [positive bin 0..3, negative bin 0..3]
+
+The common voxelization idea is:
+
+For each event
+
+    e_k = (x_k, y_k, t_k, p_k)
+
+inside a time window [t0, t1], normalize its timestamp:
+
+    tau_k = (t_k - t0) / (t1 - t0)
+    b_k = tau_k * (num_bins - 1)
+
+Then use temporal bilinear accumulation:
+
+    b0 = floor(b_k)
+    b1 = min(b0 + 1, num_bins - 1)
+    w0 = 1 - (b_k - b0)
+    w1 = b_k - b0
+
+For positive events, the channel offset is 0.
+For negative events, the channel offset is num_bins.
+
+Thus a positive event contributes to channels b0 and b1; a negative event
+contributes to channels num_bins + b0 and num_bins + b1.
+
+Out-of-bound coordinates are filtered before accumulation.
+
+The central implementation used by Night3R is:
+
+    /data/fcr/data/Night3R/dataset/event_voxel.py
+
+Important function:
+
+    build_event_voxel(events, height, width, num_bins=4,
+                      polarity_separate=True, normalize=True)
+
+This function accepts event arrays shaped [N, 4] with:
+
+    x, y, t, p
+
+or [N, 5] with:
+
+    batch_idx, x, y, t, p
+
+It treats `p > 0` as positive polarity. It supports polarity-separated
+channels and optionally normalizes non-zero voxel values to zero mean and
+unit standard deviation.
+
+Some upstream exporters use their own equivalent voxelizers for speed or
+because they operate directly on HDF5/ROS bags. The important contract is the
+same: one per-frame tensor with 8 channels, positive bins first and negative
+bins second.
+
+
+4. DL3DV synthetic event data: P-RIFE + DVS-Voltmeter
+-----------------------------------------------------
+
+DL3DV is an RGB/video dataset, not a native event-camera dataset. Therefore
+we synthesize events from RGB video frames. The pipeline is:
+
+    original DL3DV video
+        -> P-RIFE / Practical-RIFE high-FPS interpolation
+        -> frame extraction + timestamp file for DVS-Voltmeter
+        -> DVS-Voltmeter event simulation
+        -> per-frame event voxel conversion
+        -> screen-* training format
+
+The relevant upstream tools are:
+
+    P-RIFE / Practical-RIFE:
+        /data/fcr/code/event_vggt/Data_Part/Practical-RIFE
+
+    DVS-Voltmeter:
+        /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+    DL3DV helper scripts:
+        /data/fcr/data/DL3DV/run_rife_*.sh is not used;
+        the actual RIFE shell wrappers live in Practical-RIFE:
+
+        /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps.sh
+        /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps_1.sh
+
+        /data/fcr/data/DL3DV/batch_prep_dvs.py
+        /data/fcr/data/DL3DV/prep_dvs_voltmeter.py
+        /data/fcr/data/DL3DV/dl3dv_make_2k_voltmeter_dataset.py
+        /data/fcr/data/DL3DV/dl3dv_txt_to_voxels_pt_centerwin.py
+        /data/fcr/data/DL3DV/clean_bad_clips_empty_voxels.py
+
+
+4.1 P-RIFE / Practical-RIFE interpolation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Script examples:
+
+    /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps.sh
+    /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps_1.sh
+
+The wrapper scans DL3DV scene video folders such as:
+
+    /data/fcr/data/DL3DV/4K/<scene>/videos/*.mp4
+    /data/fcr/data/DL3DV/5K/<scene>/videos/*.mp4
+
+and creates:
+
+    *_240fps.mp4
+
+The core command is:
+
+    python3 inference_video.py \
+        --exp 3 \
+        --video <input.mp4> \
+        --fps 240 \
+        --scale 0.5 \
+        --output <input_240fps.mp4>
+
+Meaning of the important options:
+
+    --fps 240:
+        The output video is explicitly written at 240 FPS.
+
+    --exp 3:
+        RIFE interpolation exponent. In Practical-RIFE this corresponds to
+        2^3 interpolation in the internal setting.
+
+    --scale 0.5:
+        Downscale during interpolation, useful for high-resolution 4K/5K video.
+
+Why this step exists:
+
+    DVS-Voltmeter expects a high-frame-rate intensity sequence. If we feed it
+    only sparse original video frames, the simulated event stream is too coarse
+    and the temporal ordering is less useful. Practical-RIFE densifies the
+    RGB sequence before event simulation.
+
+
+4.2 Preparing DVS-Voltmeter input
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Scripts:
+
+    /data/fcr/data/DL3DV/batch_prep_dvs.py
+    /data/fcr/data/DL3DV/prep_dvs_voltmeter.py
+
+`batch_prep_dvs.py` scans each DL3DV scene, finds `*_240fps.mp4`, and calls
+`prep_dvs_voltmeter.py`.
+
+The important command pattern is:
+
+    python3 /data/fcr/data/DL3DV/prep_dvs_voltmeter.py \
+        --video <scene>/videos/<name>_240fps.mp4 \
+        --out_dir <scene>/dvs/<clip_id> \
+        --fps 240 \
+        --gray \
+        --base_dir /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+`prep_dvs_voltmeter.py` does two things:
+
+    1. Extracts every video frame to PNG.
+       With `--gray`, the output frames are grayscale, which is the expected
+       input for DVS-Voltmeter.
+
+    2. Writes `info.txt`.
+       Each line is:
+
+           relative_frame_path timestamp_us
+
+       Timestamps are computed from FPS:
+
+           dt_us = 1,000,000 / fps
+           timestamp_us(n) = start_ts_us + n * dt_us
+
+       For 240 FPS:
+
+           dt_us is about 4166.67 microseconds.
+
+The `relative_frame_path` is written relative to:
+
+    /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+This matters because DVS-Voltmeter is run from its own repo root and reads
+paths exactly from `info.txt`.
+
+Intermediate output layout:
+
+    /data/fcr/data/DL3DV/<split>/<scene>/dvs/<clip_id>/
+        000000.png
+        000001.png
+        ...
+        info.txt
+
+
+4.3 DVS-Voltmeter simulation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+DVS-Voltmeter repo:
+
+    /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+Important files:
+
+    main.py
+    src/config.py
+    src/simulator.py
+
+DVS-Voltmeter expects an input root like:
+
+    IN_PATH/
+        videoname1/
+            info.txt
+            frame_*.png
+        videoname2/
+            info.txt
+            frame_*.png
+
+The simulator reads each frame and timestamp, then calls:
+
+    EventSim.generate_events(image, timestamp_us)
+
+The generated event list is saved as a text file:
+
+    <video_name>.txt
+
+In our pipeline, this text file is moved/renamed to:
+
+    events.txt
+
+The runner used for DL3DV is:
+
+    /data/fcr/data/DL3DV/dl3dv_make_2k_voltmeter_dataset.py
+
+Although the script name says `2k`, it is written generically with:
+
+    --root
+    --out-root
+
+Default paths inside the script are:
+
+    --root     /data/fcr/data/DL3DV/3K
+    --out-root /data/fcr/data/DL3DV/data/3K
+
+The script does more than just run Voltmeter:
+
+    1. It defines each DL3DV clip as 49 consecutive frames.
+
+       clip 0001 -> transforms frames[0:49]
+       clip 0002 -> transforms frames[49:98]
+       in general:
+
+           start0 = (clip_index_1based - 1) * 49
+           end0   = start0 + 49
+
+    2. It copies the 49 selected RGB images from:
+
+           <source_scene>/images_4
+
+       into:
+
+           <out_scene>/<clip>/images/frame_00001.png
+           ...
+           <out_scene>/<clip>/images/frame_00049.png
+
+    3. It slices the source `transforms.json` to the same 49 frames and rewrites
+       every `file_path` to point to the copied local images.
+
+    4. It creates a temporary DVS-Voltmeter input root by symlinking the real
+       prepared DVS folder into:
+
+           /tmp/dvs_voltmeter_in/<scene>/<clip>/<clip>
+
+       Then it sets:
+
+           IN_PATH = /tmp/dvs_voltmeter_in/<scene>/<clip>
+
+    5. It uses a temporary output root:
+
+           /tmp/dvs_voltmeter_out/<scene>/<clip>
+
+    6. It creates multiple worker copies of the DVS-Voltmeter repo, because
+       DVS-Voltmeter stores input/output paths in `src/config.py`. If multiple
+       clips patch the same config file concurrently, they race. The script
+       avoids this by making per-worker repo copies under:
+
+           /tmp/dvs_voltmeter_workers
+
+    7. It runs:
+
+           python3 <worker_repo>/main.py
+
+       with a selected `CUDA_VISIBLE_DEVICES`.
+
+    8. It recursively finds the generated `.txt`, moves it to:
+
+           <out_clip_dir>/events.txt
+
+    9. It writes:
+
+           meta.json
+           voltmeter.log
+
+       so the source scene, source images, source transforms, DVS input path,
+       temporary output path, worker id, GPU id, and runtime are all traceable.
+
+Example final metadata from an existing DL3DV scene:
+
+    /data/fcr/data/train_data/DL3DV/screen-000161/meta.json
+
+This records:
+
+    source_scene_dir:
+        /data/fcr/data/DL3DV/2K/0055
+
+    source_images_dir:
+        /data/fcr/data/DL3DV/2K/0055/images_4
+
+    source_dvs_clip_dir:
+        /data/fcr/data/DL3DV/2K/0055/dvs/0001
+
+    output_events_txt:
+        /data/fcr/data/DL3DV/data/2K/0055/0001/events.txt
+
+    dvs_voltmeter_repo:
+        /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+
+4.4 Converting DL3DV `events.txt` to per-frame event voxels
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Script:
+
+    /data/fcr/data/DL3DV/dl3dv_txt_to_voxels_pt_centerwin.py
+
+This is a CPU-optimized converter. It reads:
+
+    <clip>/events.txt
+    <clip>/images/
+
+and writes:
+
+    <clip>/voxels_pt/frame_00001.pt
+    ...
+    <clip>/voxels_pt/frame_00049.pt
+
+Its input assumption is:
+
+    events.txt has 4 integer columns:
+
+        t x y p
+
+The script:
+
+    1. Loads the whole event txt by `np.fromfile`.
+
+    2. Infers image height and width from the first frame.
+
+    3. Sorts events by timestamp if needed.
+
+    4. Filters out-of-bound coordinates once per clip.
+
+    5. Builds 49 center windows from the event time range.
+
+       If the clip has event timestamps from t0 to t1, and F = 49 frames:
+
+           bound[0] = t0
+           bound[i] = t0 + (i - 0.5) * delta, for i = 1..48
+           bound[49] = t1
+
+       where:
+
+           delta = (t1 - t0) / (F - 1)
+
+       So each frame gets events around the corresponding frame center rather
+       than a purely left-aligned interval.
+
+    6. For each frame interval [bound[i], bound[i+1]), it voxelizes events
+       into shape:
+
+           [2 * bins, H, W] = [8, H, W]
+
+       with temporal bilinear assignment across the 4 bins.
+
+    7. It saves PyTorch tensors as `.pt`.
+
+    8. Unless `--keep-txt` is given, it can remove `events.txt` after all
+       `.pt` files have been verified.
+
+The script has no GPU dependency and can use many CPU workers:
+
+    --jobs 64
+    --blas-threads 1
+    --out-dtype float32
+
+A helper cleanup script exists:
+
+    /data/fcr/data/DL3DV/clean_bad_clips_empty_voxels.py
+
+It deletes DL3DV clips where `events.txt` exists but `voxels_pt/` is empty.
+
+
+4.5 Final DL3DV screen-* staging
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The final training root is:
+
+    /data/fcr/data/train_data/DL3DV
+
+It currently contains 160 `screen-*` scenes.
+
+A typical scene has:
+
+    screen-000161/
+        images/          49 RGB frames
+        events/          49 event voxel tensors
+        transforms.json  sliced 49-frame camera metadata
+        meta.json        source and Voltmeter trace
+        voltmeter.log    simulator log
+
+DL3DV does not provide our metric `depth_gt/` in this local Night3R training
+format. Therefore, in training configs, DL3DV contributes event/photo/teacher
+style signals but has zero source weight for metric depth losses.
+
+Example in the mixed config:
+
+    depth_gt_source_weights:
+        mvsec: 1.0
+        dsec: 0.35
+        dl3dv: 0.0
+
+    event_photo_source_weights:
+        mvsec: 0.4
+        dsec: 0.0
+        dl3dv: 1.0
+
+
+5. MVSEC real-event packing
+---------------------------
+
+MVSEC is a real event-camera dataset, so we do not synthesize events. We
+extract real event streams from MVSEC HDF5 files or ROS bags, rectify them,
+slice them into per-frame windows, and voxelize them.
+
+Main scripts:
+
+    /data/fcr/data/MVSEC/pack_mvsec_rectified_chunks.py
+    /data/fcr/data/MVSEC/pack_mvsec_bag_outdoor_night2.py
+
+
+5.1 MVSEC HDF5-style sequences
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Script:
+
+    /data/fcr/data/MVSEC/pack_mvsec_rectified_chunks.py
+
+Default supported sequences:
+
+    indoor_flying1
+    indoor_flying2
+    indoor_flying3
+    indoor_flying4
+    outdoor_day1
+    outdoor_day2
+
+Default output root:
+
+    /data/fcr/data/train_data/MVSEC
+
+Default packing parameters:
+
+    chunk_size = 49
+    half_us = 15000
+    bins = 4
+    min_median_events = 1000
+
+The script first analyzes candidate chunks:
+
+    1. Load image timestamps:
+
+           davis/left/image_raw_ts
+
+    2. Load depth timestamps:
+
+           davis/left/depth_image_rect_ts
+
+    3. Load pose timestamps:
+
+           davis/left/pose_ts
+
+    4. Load events:
+
+           davis/left/events
+
+    5. Select a usable time interval per sequence.
+
+    6. Use the depth timestamp as the primary frame time axis.
+
+    7. For each candidate depth frame, count events in:
+
+           [depth_ts - half_us, depth_ts + half_us]
+
+    8. Group consecutive depth frames into 49-frame chunks.
+
+    9. Keep a chunk only if its median event count is at least
+       `min_median_events`.
+
+During export, for each selected frame k:
+
+    center_ts = depth_ts[depth_idx]
+    image_idx = nearest image timestamp to center_ts
+    pose_idx  = nearest pose timestamp to center_ts
+    t0 = center_ts - half_us
+    t1 = center_ts + half_us
+
+Then the script:
+
+    1. Rectifies the grayscale image using MVSEC calibration:
+
+           cv2.fisheye.initUndistortRectifyMap(K, D, R, P)
+           cv2.remap(...)
+
+       The grayscale image is repeated into RGB channels before saving.
+
+    2. Slices real events between t0 and t1.
+
+    3. Rectifies event coordinates using:
+
+           cv2.fisheye.undistortPoints(K, D, R, P)
+
+    4. Builds an 8-channel voxel with 4 positive and 4 negative bins.
+
+    5. Saves the rectified metric depth:
+
+           depth_gt/<k>.pt
+
+    6. Saves pose records:
+
+           meta/poses_selected.npz
+
+    7. Writes:
+
+           cameras.yaml
+           meta/frames_meta.csv
+           meta/timestamp_event_center_us.txt
+           meta/timestamp_rgb_us.txt
+           meta/event_windows_us.txt
+           meta/sequence_info.txt
+           meta.json
+
+The output scene naming convention is:
+
+    screen-000001-mvsec
+    screen-000002-mvsec
+    ...
+
+
+5.2 MVSEC outdoor_night2 ROS bag sequence
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Script:
+
+    /data/fcr/data/MVSEC/pack_mvsec_bag_outdoor_night2.py
+
+This script handles the outdoor_night2 data stored as ROS bags.
+
+Default input paths:
+
+    data bag:
+        /data/fcr/data/train_data/outdoor_night2_data.bag
+
+    gt bag:
+        /data/fcr/data/train_data/outdoor_night2_gt.bag
+
+    calibration:
+        /data/fcr/data/train_data/outdoor_night_calib.zip
+
+Default output:
+
+    /data/fcr/data/train_data/MVSEC
+
+Default parameters:
+
+    chunk_size = 49
+    half_us = 15000
+    bins = 4
+    start_index = 115
+
+Topics:
+
+    RGB image:
+        /davis/left/image_raw
+
+    events:
+        /davis/left/events
+
+    depth:
+        /davis/left/depth_image_rect
+
+    pose:
+        /davis/left/pose
+
+The logic is similar to the HDF5 exporter but it streams from ROS bags:
+
+    1. Scan GT bag timestamps for depth and pose.
+
+    2. Scan data bag timestamps for RGB images and event message range.
+
+    3. Select depth-index chunks of length 49.
+
+    4. For each depth frame, use depth timestamp as event center.
+
+    5. Use nearest RGB image and nearest pose.
+
+    6. Gather event messages overlapping each window.
+
+    7. Rectify images and event coordinates.
+
+    8. Build [8, H, W] event voxels.
+
+    9. Save image, event voxel, depth_gt, camera, pose, and metadata.
+
+This outdoor_night2 path is important because it gives us real night event
+data with metric depth and pose-like metadata in the same screen-* format as
+the rest of Night3R.
+
+
+6. DSEC real-event packing
+--------------------------
+
+DSEC is also a real event-camera dataset. We convert it into the same
+screen-* format with:
+
+    /data/fcr/data/Night3R/utils/pack_dsec_to_mvsec_format.py
+
+Default paths:
+
+    root:
+        /data/fcr/data/train_data/DSEC
+
+    sequence:
+        interlaken_00_c
+
+Default parameters:
+
+    num_bins = 4
+    polarity_separate = True
+    event_window = between_frames
+    disparity_scale = 256.0
+
+Expected DSEC inputs:
+
+    <sequence>_images_rectified_left.zip
+    <sequence>_events_left.zip
+    <sequence>_disparity_image.zip
+    <sequence>_calibration.zip
+    <sequence>_image_timestamps.txt
+    <sequence>_disparity_timestamps.txt
+    <sequence>_image_exposure_timestamps_left.txt
+
+For each selected frame:
+
+    1. Read the rectified left RGB image from zip.
+
+    2. Read disparity image and convert to metric depth:
+
+           disp = disp_raw / disparity_scale
+           depth = fx / (disp * Q[3,2])
+
+       Invalid disparity becomes depth 0.
+
+    3. Build the event time window.
+
+       If `event_window = between_frames`:
+
+           start = previous image timestamp, or current image timestamp
+                   for the first frame
+           end   = current image timestamp
+
+       If `event_window = centered`:
+
+           use exposure start/end if available; otherwise use a centered
+           interval estimated from neighboring image timestamps.
+
+    4. Load event timestamps from events.h5 and add `t_offset` if present.
+
+    5. Slice events with binary search:
+
+           left  = first event >= start_us
+           right = last event <= end_us
+
+    6. Convert event timestamps to relative time inside the window:
+
+           t_rel = event_ts - start_us
+
+    7. Rectify event coordinates if `rectify_map.h5` exists.
+
+    8. Resize event coordinates to the chosen image size if `--image-size`
+       is provided.
+
+    9. Call Night3R's shared voxelizer:
+
+           build_event_voxel(events_np, h, w,
+                             num_bins=4,
+                             polarity_separate=True,
+                             normalize=True)
+
+    10. Save:
+
+           images/<frame>.png
+           events/<frame>.pt
+           depth_gt/<frame>.pt
+           cameras.yaml
+           meta/frames_meta.csv
+           meta/timestamp_rgb_us.txt
+           meta/timestamp_event_center_us.txt
+           meta/event_windows_us.txt
+           meta.json
+
+The DSEC meta explicitly records:
+
+    source: DSEC
+    event_rectified: true/false
+    depth_source: dsec/disparity_image
+    depth_units: meters
+    depth_invalid_value: 0.0
+    depth_protocol: sparse_metric_depth_zero_invalid
+
+
+7. DSEC split policy
+--------------------
+
+The official DSEC holdout manifest is:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/manifest.json
+
+Split policy:
+
+    scene_level_holdout
+
+Reason:
+
+    Avoid adjacent-frame leakage from fixed stride-1 pairs.
+
+Train scenes:
+
+    screen-000001-dsec
+        sequence: interlaken_00_c
+        frames: 269
+
+    screen-000002-dsec
+        sequence: interlaken_00_e
+        frames: 996
+
+Test scene:
+
+    screen-000003-dsec
+        sequence: zurich_city_02_b
+        frames: 613
+
+Train root:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train
+
+Test root:
+
+    /data/fcr/data/train_data/DSEC_test
+
+Important rule:
+
+    Final DSEC numbers should be reported only on:
+
+        /data/fcr/data/train_data/DSEC_test/screen-000003-dsec
+
+    This root should not be used for training.
+
+
+8. MVSEC current night test selection
+-------------------------------------
+
+Current MVSEC night test root:
+
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test
+
+Manifest:
+
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test/selection_summary.json
+
+This is a 6-scene symlink root selected from:
+
+    /data/fcr/data/train_data/MVSEC
+
+Selected scenes:
+
+    screen-000123-mvsec
+    screen-000157-mvsec
+    screen-000200-mvsec
+    screen-000205-mvsec
+    screen-000207-mvsec
+    screen-000220-mvsec
+
+Selection intent recorded in the manifest:
+
+    visual diversity
+    brighter/darker samples
+    event sparse/dense cases
+    moderate-to-large motion
+
+Official eval protocol recorded there:
+
+    pair_sampling: fixed
+    pair_stride: 1
+    max_batches: 128
+
+Visual debug protocol:
+
+    pair_sampling: fixed
+    pair_stride: 7
+    max_pairs_per_scene: 1
+
+
+9. DL3DV hard/stress splits
+---------------------------
+
+DL3DV does not provide metric `depth_gt/` in our local Night3R format, so the
+DL3DV splits are mainly stress, qualitative, and diagnostic splits rather than
+the main metric-depth benchmark.
+
+Current hard split:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_hard_test_v1
+
+Manifest:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_hard_test_v1/selection_manifest.json
+
+Selection policy:
+
+    Rank scenes from `/data/fcr/data/eval_data/DL3DV` by:
+
+        low RGB brightness
+        low/varied contrast and saturation
+        high event occupancy/activity
+        pair 24 -> 31
+
+The split contains 12 selected scenes and is intended as a hard stress split,
+not an unbiased main benchmark.
+
+Pair:
+
+    idx1 = 24
+    idx2 = 31
+    pair_stride = 7
+
+Another diagnostic split:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_mast3r_gap_test_v1
+
+Its README states that it is selected from local DL3DV to show a large
+verified difference between RGB-only and RGB+event under the existing low-light
+protocol. It should be used as a hard stress/qualitative split, while the full
+DL3DV eval root is more appropriate for broader supplementary reporting.
+
+
+10. What we borrowed from Dark3R's data construction
+----------------------------------------------------
+
+Dark3R upstream repo:
+
+    /data/fcr/data/Dark3R
+
+Important files:
+
+    /data/fcr/data/Dark3R/README.md
+    /data/fcr/data/Dark3R/dataset/raw_dataset.py
+    /data/fcr/data/Dark3R/dataset/raw_real_dataset.py
+    /data/fcr/data/Dark3R/utils/generate_training_pairs.py
+
+Dark3R itself is RGB low-light reconstruction. It does not build event voxels
+for the original paper path. The useful data ideas we inherit are:
+
+
+10.1 Offline processed dataset layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dark3R organizes data by:
+
+    scene
+        exposure
+            resolution
+                images
+                metadata
+
+Example naming:
+
+    iso102400_s1_00125
+
+means ISO 102400 and exposure time 1/125s.
+
+Night3R keeps the same spirit: the expensive processing is done offline, and
+training sees a clean, uniform directory format. Instead of making the model
+parse raw videos, raw event HDF5 files, or ROS bags during training, we export
+everything into screen-* scenes with precomputed tensors and metadata.
+
+
+10.2 Clean/noisy correspondence idea
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dark3R's `RawRealDataset` maps noisy low-light captures back to a cleaner
+reference exposure using a YAML config:
+
+    dataset/dataset_config/finetuning_real_datasets_1023.yml
+
+It tracks:
+
+    clean_iso_et
+    noisy_iso_et
+
+For a noisy image path, the loader replaces the noisy exposure string with the
+clean exposure string to find the reference image.
+
+Night3R does not use this exact clean/noisy image supervision for event data,
+but the broader idea is reused:
+
+    keep source metadata explicit,
+    preserve aligned frame correspondence,
+    do not rely on fragile filename guessing inside the model,
+    make each sample traceable back to the original source.
+
+
+10.3 Synthetic low-light/noise idea
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dark3R's `RawDataset` creates synthetic noisy raw images from clean images with
+a calibrated Poisson-Gaussian style model:
+
+    image_clean = (M1 - black_level_1) / scaling_factor + black_level_2
+    noise_variance = max(alpha * image_clean + beta, 0)
+    noise = Normal(0, sqrt(noise_variance))
+    noisy = image_clean + noise
+
+Night3R uses a simpler continuous low-light augmentation for RGB inputs in the
+event training path, configured in:
+
+    /data/fcr/data/Night3R/dataset/lowlight_augmentation.py
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+Reference config values:
+
+    lowlight_aug:
+        enabled: true
+        min_exposure: 0.03
+        max_exposure: 1.0
+        read_noise_std: 0.01
+        shot_noise: true
+        gamma_space_input: true
+
+This is not the same as Dark3R raw noise simulation, but it follows the same
+principle: expose the reconstruction backbone to low-light/noisy image
+conditions while keeping geometry supervision and source metadata explicit.
+
+
+10.4 Pair generation and overlap-aware sampling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dark3R uses MASt3R retrieval to generate training pairs:
+
+    /data/fcr/data/Dark3R/utils/generate_training_pairs.py
+
+The key idea is:
+
+    do not train on arbitrary image pairs;
+    choose pairs with enough visual overlap.
+
+The script:
+
+    1. Loads MASt3R ViT-Large metric model.
+
+    2. Loads the retrieval checkpoint:
+
+           MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth
+
+    3. Computes a similarity matrix over images in each scene.
+
+    4. Uses:
+
+           make_pairs_fps(sim_matrix, Na=winsize, tokK=refid)
+
+    5. Saves a JSON mapping from each image index to candidate paired indices.
+
+Night3R keeps pair sampling explicit and bounded. For MVSEC/DSEC/DL3DV screen
+data, the common setting is random temporal pair distance between 1 and 7,
+with optional reverse direction. For special evaluation, fixed pair stride is
+used so the protocol is deterministic.
+
+
+10.5 What is different from Dark3R
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dark3R:
+
+    RGB-only low-light data construction.
+    Clean/noisy exposure pairs.
+    Optional synthetic raw noise.
+    Retrieval-generated RGB image pairs.
+    No event voxel in the original RGB path.
+
+Night3R:
+
+    RGB + event data construction.
+    Real events from MVSEC/DSEC.
+    Synthetic events from DL3DV via Practical-RIFE + DVS-Voltmeter.
+    Per-frame event voxels saved as .pt tensors.
+    Metric depth where available.
+    Source-aware metadata and source-aware loss weights.
+
+So the part borrowed from Dark3R is not "the exact same data"; it is the
+offline, traceable, pair-based reconstruction data organization and the
+MASt3R-compatible training interface.
+
+
+11. Dark3R-inspired darkening and how to validate it
+----------------------------------------------------
+
+This part is important to state carefully.
+
+Dark3R's original synthetic low-light path can operate in a raw-like linear
+domain. It simulates sensor noise with black-level correction, exposure/scaling
+changes, and Poisson-Gaussian noise. That is physically meaningful because raw
+measurements are close to linear sensor counts.
+
+Night3R's current data, however, is not stored as Bayer raw or 14-bit raw
+measurements. MVSEC, DSEC, and DL3DV are all consumed by our loader as
+rectified RGB/PNG-like images plus precomputed event voxels. Therefore our
+actual implemented darkening should not be described as raw-domain synthesis.
+It is better described as:
+
+    Dark3R-inspired, physics-inspired RGB degradation in linearized image space.
+
+The implementation is:
+
+    /data/fcr/data/Night3R/dataset/lowlight_augmentation.py
+
+The loader first reads images into [0, 1] RGB tensors. When low-light
+augmentation is enabled, it creates a dark input by:
+
+    1. approximate inverse gamma:
+
+           I_linear = I_rgb ^ 2.2
+
+    2. exposure scaling:
+
+           I_dark_linear = exposure * I_linear
+
+    3. shot noise:
+
+           sigma_shot = sqrt(max(I_dark_linear, 0) + eps) * read_noise_std
+           I_dark_linear += Normal(0, sigma_shot)
+
+    4. read noise:
+
+           I_dark_linear += Normal(0, read_noise_std)
+
+    5. clamp and map back to RGB/gamma space:
+
+           I_dark_rgb = clamp(I_dark_linear, 0, 1) ^ (1 / 2.2)
+
+Reference config:
+
+    lowlight_aug:
+        enabled: true
+        min_exposure: 0.03
+        max_exposure: 1.0
+        read_noise_std: 0.01
+        shot_noise: true
+        gamma_space_input: true
+
+This is not identical to Dark3R's raw noise model. The reason is practical:
+our event-RGB datasets have already passed through camera/image processing
+steps such as rectification, grayscale/RGB conversion, demosaicing or dataset
+rendering, and possibly tone mapping. Once images are stored as PNG/RGB, the
+true raw sensor count distribution is no longer available. Applying raw noise
+parameters directly to such RGB images would be a fake raw assumption.
+
+The correct claim is:
+
+    Inspired by Dark3R's raw-domain low-light synthesis, we approximate the
+    linear sensor domain by inverse-gamma correction and apply exposure scaling
+    with shot/read noise before mapping back to RGB space.
+
+The wrong claim would be:
+
+    We perform Dark3R raw-domain noise synthesis.
+
+
+11.1 Why inverse gamma is more reasonable than direct RGB darkening
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Directly multiplying sRGB values is simple:
+
+    I_dark = exposure * I_rgb
+
+But sRGB is gamma-compressed and not linear with scene radiance. Real exposure
+change and photon noise happen before gamma/tone mapping, closer to the sensor
+linear domain. Therefore Night3R uses:
+
+    I_rgb -> approximate linear RGB -> exposure/noise -> RGB
+
+This does not recover true raw data, but it is a better approximation than
+doing exposure and noise directly in gamma-compressed RGB space.
+
+Intuition:
+
+    In a real camera, darker exposure reduces photon counts before image
+    rendering. Shot noise is signal-dependent, and read noise remains even in
+    dark regions. Direct sRGB multiplication mostly changes brightness but does
+    not create the same mean-variance relation.
+
+
+11.2 What we need to prove experimentally
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+We do not need to prove that the approximation is equivalent to raw. That would
+be too strong and would require real raw sensor data with camera calibration.
+
+The realistic proof target is:
+
+    1. Our linearized RGB degradation is more physically plausible than direct
+       sRGB darkening.
+
+    2. It improves real low-light/night reconstruction compared with no
+       darkening or direct RGB darkening.
+
+Thus the experiments should be framed as validation of the approximation, not
+as proof of raw-domain equivalence.
+
+
+11.3 Main ablation: darkening strategy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Train or evaluate the same Night3R architecture with only the RGB degradation
+strategy changed.
+
+Suggested variants:
+
+    No darken:
+        Use the original RGB image directly.
+
+    sRGB multiply:
+        I_dark = exposure * I_rgb.
+        This is the simple non-physical baseline.
+
+    Linear exposure:
+        I_linear = I_rgb ^ 2.2,
+        I_dark_linear = exposure * I_linear,
+        I_dark = I_dark_linear ^ (1 / 2.2).
+
+    Linear + read noise:
+        Same as linear exposure, plus additive Gaussian read noise in the
+        linearized domain.
+
+    Linear + shot + read noise:
+        Current Night3R augmentation.
+
+Suggested table:
+
+    | Variant | Domain | Exposure | Shot noise | Read noise | MVSEC AbsRel | DSEC AbsRel | DL3DV warp |
+    |---|---|---:|---:|---:|---:|---:|---:|
+    | No darken | RGB | no | no | no | - | - | - |
+    | sRGB multiply | gamma RGB | yes | no | no | - | - | - |
+    | Linear exposure | inverse-gamma RGB | yes | no | no | - | - | - |
+    | Linear + read | inverse-gamma RGB | yes | no | yes | - | - | - |
+    | Linear + shot + read | inverse-gamma RGB | yes | yes | yes | - | - | - |
+
+Evaluation roots:
+
+    MVSEC current night test:
+        /data/fcr/data/train_data/MVSEC_outdoor_night2_test
+
+    DSEC test:
+        /data/fcr/data/train_data/DSEC_test
+
+    DL3DV hard/stress split:
+        /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_hard_test_v1
+
+Useful metrics:
+
+    MVSEC/DSEC:
+        AbsRel, RMSE, depth median/p90/p98 stability, valid depth fraction.
+
+    DL3DV:
+        photometric/warp consistency, p98 depth sanity, qualitative stability.
+
+    Event contribution sanity:
+        real event vs zero event vs shuffled event.
+
+Expected interpretation:
+
+    If linearized RGB degradation performs better than direct sRGB darkening
+    on real night/low-light evaluation, then the inverse-gamma approximation
+    is justified as a useful physical prior for our processed RGB data.
+
+
+11.4 Image-statistics sanity experiment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This experiment does not require training. It checks whether the synthetic
+darkened images statistically resemble real night images better than direct
+sRGB darkening.
+
+Compare three image groups:
+
+    real night images:
+        MVSEC/DSEC night or low-light frames.
+
+    sRGB darkened images:
+        original RGB multiplied directly in gamma space.
+
+    our darkened images:
+        inverse gamma -> exposure/noise -> gamma.
+
+Compute:
+
+    brightness histogram:
+        distribution of pixel intensity.
+
+    dark pixel ratio:
+        fraction of pixels below thresholds such as 0.05 and 0.10.
+
+    gradient magnitude distribution:
+        whether edges remain realistic or become over-smoothed/over-noisy.
+
+    patch mean-variance curve:
+        divide images into small patches, compute patch mean and patch variance,
+        then plot variance as a function of mean.
+
+The patch mean-variance curve is the most important one. In real cameras, shot
+noise is signal-dependent, so variance generally changes with brightness.
+Direct sRGB multiplication tends to preserve an unnatural noise relation,
+whereas linearized exposure with shot/read noise should be closer to real
+low-light images.
+
+Suggested table:
+
+    | Method | Brightness hist distance | Dark pixel ratio error | Mean-variance curve error | Gradient distribution error |
+    |---|---:|---:|---:|---:|
+    | sRGB multiply | - | - | - | - |
+    | Linear exposure | - | - | - | - |
+    | Linear + read | - | - | - | - |
+    | Linear + shot + read | - | - | - | - |
+
+The exact distance can be simple:
+
+    L1 distance between normalized histograms,
+    Wasserstein distance,
+    or mean squared error between binned mean-variance curves.
+
+This experiment supports the claim that our degradation is statistically more
+reasonable than direct gamma-space darkening.
+
+
+11.5 Optional stronger experiment with paired clean/noisy data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If we can access paired clean/noisy exposure data from Dark3R-style captures,
+we can do a stronger validation:
+
+    clean image
+        -> synthesize low-light with our method
+
+    real noisy/short-exposure image
+        -> target distribution
+
+Then compare:
+
+    patch mean-variance curve,
+    residual histogram,
+    dark-region gradient distribution,
+    low-level feature matching count,
+    MASt3R/Dark3R feature stability.
+
+This is optional because our main MVSEC/DSEC/DL3DV pipeline does not provide
+true raw clean/noisy pairs. It is useful as a supplementary sanity check, but
+the main proof should still be task-level reconstruction ablation on our
+actual event-RGB datasets.
+
+
+11.6 Recommended wording for the paper
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Good wording:
+
+    Inspired by Dark3R's raw-domain low-light synthesis, we apply a lightweight
+    physics-inspired RGB degradation. Since our event-RGB datasets are stored
+    as rectified RGB frames rather than Bayer raw measurements, we approximate
+    the linear image formation domain by inverse-gamma correction, apply
+    exposure scaling with shot and read noise, and map the result back to RGB
+    space.
+
+Another compact version:
+
+    We do not assume access to raw sensor measurements. Instead, we use a
+    Dark3R-inspired linearized-RGB degradation that preserves the key physical
+    ingredients of exposure reduction and signal-dependent noise while
+    remaining compatible with processed event-RGB datasets.
+
+Avoid claiming:
+
+    raw-domain synthesis,
+    true sensor raw simulation,
+    exact camera noise modeling.
+
+Claim:
+
+    raw-inspired,
+    physics-inspired,
+    linearized RGB approximation,
+    validated by degradation ablation and image-statistics sanity checks.
+
+
+12. Event extraction by source
+------------------------------
+
+MVSEC:
+
+    Raw source:
+        HDF5 or ROS bag event stream.
+
+    Event fields:
+        x, y, timestamp, polarity.
+
+    Time window:
+        centered around depth timestamp:
+
+            [center_ts - 15000us, center_ts + 15000us]
+
+    Geometry alignment:
+        event coordinates are rectified with MVSEC fisheye calibration.
+
+    Output:
+        one [8, H, W] tensor per selected frame.
+
+
+DSEC:
+
+    Raw source:
+        events.h5 inside `<sequence>_events_left.zip`.
+
+    Event fields:
+        x, y, t, p or xs, ys, ts, ps.
+
+    Time window:
+        by default, between neighboring image timestamps:
+
+            previous image timestamp -> current image timestamp
+
+        or centered/exposure-based if the `centered` mode is selected.
+
+    Geometry alignment:
+        event coordinates are mapped through `rectify_map.h5` when present,
+        then resized to the target image size.
+
+    Output:
+        one [8, H, W] tensor per selected frame.
+
+
+DL3DV:
+
+    Raw source:
+        RGB video and COLMAP/transforms-style metadata.
+
+    Synthetic event source:
+        DVS-Voltmeter output `events.txt` after Practical-RIFE interpolation.
+
+    Event fields:
+        t, x, y, p in `events.txt`.
+
+    Time window:
+        center-window split over the full simulated event time range into
+        49 per-frame windows.
+
+    Geometry alignment:
+        no event-camera calibration is available, because these are simulated
+        from the RGB frame plane. The simulated event coordinates already live
+        in the image plane of the extracted frames.
+
+    Output:
+        one [8, H, W] tensor per selected frame.
+
+
+13. Data splitting vs event splitting
+-------------------------------------
+
+It is important to separate two ideas:
+
+    event window splitting:
+        how one continuous event stream is sliced into a per-frame event voxel.
+
+    dataset split:
+        which scenes are used for training/evaluation/testing.
+
+For event window splitting:
+
+    MVSEC:
+        center around metric depth timestamp with +/- 15000us.
+
+    DSEC:
+        default between image frames, optionally centered/exposure-based.
+
+    DL3DV:
+        center windows across a 49-frame simulated event clip.
+
+For dataset split:
+
+    MVSEC:
+        main root has all exported scenes.
+        current night test root is a 6-scene selected symlink root.
+
+    DSEC:
+        scene-level holdout:
+            interlaken scenes for training,
+            zurich_city_02_b for test.
+
+    DL3DV:
+        training root has 160 processed synthetic-event scenes.
+        hard/stress splits are selected separately for diagnostics.
+
+
+14. Why the 49-frame clip format is used
+----------------------------------------
+
+The DL3DV event generation script defines each clip as 49 frames:
+
+    frames_per_clip = 49
+
+For clip index n:
+
+    transforms frame slice = [(n - 1) * 49 : n * 49]
+
+The same 49-frame chunk size is also used by MVSEC exporters. This gives the
+loader a consistent medium-length local sequence per screen-* scene. Training
+still samples only pairs from the scene, but the scene contains enough nearby
+frames to draw stride-1 to stride-7 pairs.
+
+
+15. Quality control and cleanup
+-------------------------------
+
+DL3DV helper scripts:
+
+    /data/fcr/data/DL3DV/scan_bad_mp4.py
+        scan broken input videos.
+
+    /data/fcr/data/DL3DV/dl3dv_filter_indoor.py
+        filter scenes by category when needed.
+
+    /data/fcr/data/DL3DV/delete_indoor_scenes.py
+        remove unwanted indoor scenes when building a specific split.
+
+    /data/fcr/data/DL3DV/clean_bad_clips_empty_voxels.py
+        delete clips where events.txt exists but voxel output is empty.
+
+    /data/fcr/data/DL3DV/clean_delete_videos.py
+        remove large intermediate videos folders after processing.
+
+MVSEC quality control:
+
+    `pack_mvsec_rectified_chunks.py` computes event counts for each candidate
+    frame and keeps only chunks whose median event count passes the threshold.
+
+DSEC quality control:
+
+    `pack_dsec_to_mvsec_format.py` records number of events per frame in
+    `meta/frames_meta.csv`, and records whether event rectification was used.
+
+
+16. How the training config consumes the data
+---------------------------------------------
+
+Reference mixed-source config:
+
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+Dataset roots:
+
+    dataset:
+        root:
+            - /data/fcr/data/train_data/MVSEC
+            - /data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/dsec_train
+            - /data/fcr/data/train_data/DL3DV
+
+Image/event settings:
+
+    image_size: [512, 512]
+    pair_sampling: random
+    min_pair_distance: 1
+    max_pair_distance: 7
+    allow_reverse_pairs: true
+    expected event channels: 8
+
+Training uses balanced dataset sampling:
+
+    balanced_dataset_sampling: true
+
+This matters because MVSEC, DSEC, and DL3DV have different numbers of scenes
+and different supervision availability. Without balanced sampling, the largest
+root can dominate the training stream.
+
+Source-aware supervision:
+
+    MVSEC:
+        metric depth, depth gradient, event/depth edge, some photometric signal.
+
+    DSEC:
+        sparse metric depth from disparity, depth gradient, event/depth edge.
+
+    DL3DV:
+        synthetic events and photometric/teacher-style stabilization, but no
+        metric depth_gt in this local format.
+
+
+17. Short paper-style description
+---------------------------------
+
+We convert all training sources into a unified event-RGB sequence format. Each
+scene contains RGB frames, per-frame event voxels, camera metadata, and metric
+depth whenever available. Real event datasets are processed from their native
+event streams: MVSEC events are sliced around depth timestamps and rectified
+using the provided fisheye calibration, while DSEC events are sliced from HDF5
+streams according to image/exposure timestamps and mapped through the provided
+rectification maps. In both cases, events are accumulated into polarity-
+separated temporal voxel grids with four bins for positive events and four bins
+for negative events.
+
+For RGB-only DL3DV videos, we synthesize event streams. We first use
+Practical-RIFE to interpolate each video to a high frame rate, then prepare the
+interpolated frames and microsecond timestamps in the input format expected by
+DVS-Voltmeter. DVS-Voltmeter simulates asynchronous event streams from the
+high-frame-rate intensity sequence. The resulting event text files are split
+into 49 center-aligned frame windows and converted into the same 8-channel
+event voxel format used by the real event datasets.
+
+Our data construction follows the offline, traceable data organization used in
+Dark3R: expensive preprocessing is performed once, each scene stores explicit
+camera/pose/depth/timestamp metadata, and training samples image pairs from a
+bounded or precomputed set instead of recomputing raw data alignment online.
+The difference is that Night3R extends this organization with event tensors:
+real event voxels for MVSEC/DSEC and simulated event voxels for DL3DV.
+
+
+18. Key files
+-------------
+
+Night3R dataset loader:
+
+    /data/fcr/data/Night3R/dataset/dsec_event_dataset.py
+
+Night3R shared event voxel builder:
+
+    /data/fcr/data/Night3R/dataset/event_voxel.py
+
+Night3R reference mixed training config:
+
+    /data/fcr/data/Night3R/config/train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+DL3DV Practical-RIFE wrappers:
+
+    /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps.sh
+    /data/fcr/code/event_vggt/Data_Part/Practical-RIFE/run_rife_240fps_1.sh
+
+DL3DV DVS preparation:
+
+    /data/fcr/data/DL3DV/batch_prep_dvs.py
+    /data/fcr/data/DL3DV/prep_dvs_voltmeter.py
+
+DL3DV DVS-Voltmeter runner and 49-frame clip builder:
+
+    /data/fcr/data/DL3DV/dl3dv_make_2k_voltmeter_dataset.py
+
+DL3DV events.txt to voxel conversion:
+
+    /data/fcr/data/DL3DV/dl3dv_txt_to_voxels_pt_centerwin.py
+
+DVS-Voltmeter repo:
+
+    /data/fcr/code/event_vggt/Data_Part/DVS-Voltmeter
+
+Practical-RIFE repo:
+
+    /data/fcr/code/event_vggt/Data_Part/Practical-RIFE
+
+MVSEC HDF5 exporter:
+
+    /data/fcr/data/MVSEC/pack_mvsec_rectified_chunks.py
+
+MVSEC outdoor_night2 ROS bag exporter:
+
+    /data/fcr/data/MVSEC/pack_mvsec_bag_outdoor_night2.py
+
+DSEC exporter:
+
+    /data/fcr/data/Night3R/utils/pack_dsec_to_mvsec_format.py
+
+DSEC split manifest:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dsec_holdout_v1/manifest.json
+
+MVSEC current test selection:
+
+    /data/fcr/data/train_data/MVSEC_outdoor_night2_test/selection_summary.json
+
+DL3DV hard split manifest:
+
+    /data/fcr/data/Night3R/outputs/splits/night3r_dl3dv_hard_test_v1/selection_manifest.json
+
+Dark3R data references:
+
+    /data/fcr/data/Dark3R/README.md
+    /data/fcr/data/Dark3R/dataset/raw_dataset.py
+    /data/fcr/data/Dark3R/dataset/raw_real_dataset.py
+    /data/fcr/data/Dark3R/utils/generate_training_pairs.py

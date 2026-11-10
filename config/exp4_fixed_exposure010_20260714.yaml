@@ -1,0 +1,7 @@
+_base_: train_night3r_event_reliability_dsec_holdout_v1_8gpu.yaml
+
+# Compare fixed-severity darkening with the full log-uniform exposure range.
+lowlight_aug:
+  min_exposure: 0.1
+  max_exposure: 0.1
+
